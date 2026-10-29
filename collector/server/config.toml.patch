@@ -1,0 +1,11 @@
+diff --git a/supabase/config.toml b/supabase/config.toml
+index 4edd8b1..1409323 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -17,3 +17,6 @@ verify_jwt = false
+ 
+ [functions.gateway-checklist]
+ verify_jwt = false
++
++[functions.collector-ingest]
++verify_jwt = false

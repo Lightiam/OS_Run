@@ -1,0 +1,167 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 8cdcb97..b0d8edd 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -51,6 +51,7 @@ import OAuthConsent from "./pages/OAuthConsent";
+ import MtmcConsole from "./pages/MtmcConsole";
+ import GatewaySetup from "./pages/GatewaySetup";
+ import ComputeProviders from "./pages/ComputeProviders";
++import Infrastructure from "./pages/Infrastructure";
+ 
+ const queryClient = new QueryClient();
+ 
+@@ -116,6 +117,7 @@ const App = () => (
+             <Route path="accelerator" element={<AcceleratorRuntime />} />
+             <Route path="gateway-setup" element={<GatewaySetup />} />
+             <Route path="providers" element={<ComputeProviders />} />
++            <Route path="infrastructure" element={<Infrastructure />} />
+           </Route>
+ 
+           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+diff --git a/src/components/dashboard/DashboardSidebar.tsx b/src/components/dashboard/DashboardSidebar.tsx
+index b90597f..e7d034f 100644
+--- a/src/components/dashboard/DashboardSidebar.tsx
++++ b/src/components/dashboard/DashboardSidebar.tsx
+@@ -29,6 +29,7 @@ import {
+   BatteryCharging,
+   CreditCard,
+   CircuitBoard,
++  HardDrive,
+ } from "lucide-react";
+ import { cn } from "@/lib/utils";
+ 
+@@ -50,6 +51,7 @@ const monitoringItems = [
+ 
+ const lightosItems = [
+   { icon: CloudCog, label: "Compute Providers", path: "/dashboard/providers" },
++  { icon: HardDrive, label: "Infrastructure", path: "/dashboard/infrastructure" },
+   { icon: Server, label: "Clusters", path: "/dashboard/clusters" },
+   { icon: FileText, label: "Runs", path: "/dashboard/runs" },
+   { icon: Settings, label: "Gateway Setup", path: "/dashboard/gateway-setup" },
+diff --git a/src/integrations/supabase/types.ts b/src/integrations/supabase/types.ts
+index 1748167..8458475 100644
+--- a/src/integrations/supabase/types.ts
++++ b/src/integrations/supabase/types.ts
+@@ -56,6 +56,92 @@ export type Database = {
+         }
+         Relationships: []
+       }
++      collector_environments: {
++        Row: {
++          created_at: string
++          id: string
++          key_hash: string
++          key_prefix: string
++          last_hostname: string | null
++          last_seen_at: string | null
++          measurement_count: number
++          name: string
++          status: string
++          updated_at: string
++          user_id: string
++        }
++        Insert: {
++          created_at?: string
++          id?: string
++          key_hash: string
++          key_prefix: string
++          last_hostname?: string | null
++          last_seen_at?: string | null
++          measurement_count?: number
++          name: string
++          status?: string
++          updated_at?: string
++          user_id: string
++        }
++        Update: {
++          created_at?: string
++          id?: string
++          key_hash?: string
++          key_prefix?: string
++          last_hostname?: string | null
++          last_seen_at?: string | null
++          measurement_count?: number
++          name?: string
++          status?: string
++          updated_at?: string
++          user_id?: string
++        }
++        Relationships: []
++      }
++      collector_measurements: {
++        Row: {
++          collected_at: string
++          environment_id: string
++          host: Json
++          hostname: string
++          id: number
++          metrics: Json
++          received_at: string
++          schema_version: string
++          user_id: string
++        }
++        Insert: {
++          collected_at: string
++          environment_id: string
++          host?: Json
++          hostname: string
++          id?: never
++          metrics?: Json
++          received_at?: string
++          schema_version: string
++          user_id: string
++        }
++        Update: {
++          collected_at?: string
++          environment_id?: string
++          host?: Json
++          hostname?: string
++          id?: never
++          metrics?: Json
++          received_at?: string
++          schema_version?: string
++          user_id?: string
++        }
++        Relationships: [
++          {
++            foreignKeyName: "collector_measurements_environment_id_fkey"
++            columns: ["environment_id"]
++            isOneToOne: false
++            referencedRelation: "collector_environments"
++            referencedColumns: ["id"]
++          },
++        ]
++      }
+       gpu_metrics: {
+         Row: {
+           created_at: string
+@@ -516,6 +602,29 @@ export type Database = {
+       [_ in never]: never
+     }
+     Functions: {
++      collector_environment_create: {
++        Args: { p_name: string }
++        Returns: {
++          created_at: string
++          id: string
++          key: string
++          key_prefix: string
++          name: string
++        }[]
++      }
++      collector_environment_revoke: {
++        Args: { p_id: string }
++        Returns: undefined
++      }
++      collector_environment_touch: {
++        Args: {
++          p_accepted: number
++          p_hostname: string
++          p_id: string
++          p_last_seen: string
++        }
++        Returns: undefined
++      }
+       has_active_subscription: {
+         Args: { check_env?: string; user_uuid: string }
+         Returns: boolean

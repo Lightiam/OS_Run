@@ -9,6 +9,7 @@ LightOS app. No inbound ports, no public IP, no port forwarding.
 | Path | What it is |
 |---|---|
 | [`collector-box-runbook.md`](collector-box-runbook.md) | Hardware spec and the Ubuntu setup walkthrough for the collector box, end to end |
+| [`collector/`](collector/README.md) | The collector subsystem: agent, ingest endpoint, schema and UI |
 | `Olares/` | Submodule pointing at [beclab/Olares](https://github.com/beclab/Olares) at `3a1a0fb` |
 | `Olares-main/` | A snapshot of the same upstream tree, extracted from the repository zip |
 
@@ -21,16 +22,17 @@ upstream's code, not this project's.
 
 ## The collector itself
 
-The runbook is the entry point. The code it installs and talks to lives in two
-other repositories:
+The runbook is the entry point and [`collector/`](collector/README.md) holds
+the code, all of it, so this repository is what you point at:
 
-- **Agent** — `tools/lightcollect/` in [Lightiam/LightOS](https://github.com/Lightiam/LightOS).
-  One standard-library Python file: reads `/proc`, batches measurements as
-  newline-delimited JSON, spools to disk when the network is down.
-- **Endpoint, schema and UI** — the `collector-ingest` edge function, the
-  `collector_environments` / `collector_measurements` migration, and the
-  Infrastructure page in
-  [Lightingmedia/agenticlightossh](https://github.com/Lightingmedia/agenticlightossh).
+- **Agent** — `collector/lightcollect/`. One standard-library Python file:
+  reads `/proc`, batches measurements as newline-delimited JSON, spools to disk
+  when the network is down.
+- **Endpoint and schema** — `collector/server/`. Deploys to Supabase.
+- **UI** — `collector/app/`. Copied into the app's own tree, with the route,
+  sidebar entry and generated types supplied as a patch.
+
+Nothing here is deployed yet. `collector/README.md` has the two commands.
 
 Keys are `lfc_` strings minted in the app's Infrastructure page. Only their
 SHA-256 is stored, so a key is shown once and never recoverable.
