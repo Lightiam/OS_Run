@@ -15,3 +15,4 @@ collector.env
 collector/server/local/*.db
 collector/server/local/*.db-wal
 collector/server/local/*.db-shm
+collector/sender/sent-cursor.json
