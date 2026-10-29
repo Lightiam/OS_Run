@@ -105,6 +105,19 @@ python lightcollect.py --print --root /path/to/fakeroot
 which writes a usable tree. Readings then describe the fixture, not the
 machine, which is fine for checking delivery and wrong for anything else.
 
+## Sending to the hosted app
+
+The sender that forwards these measurements to the hosted Infrastructure page
+lives in `collector/sender/` in **Lightiam/product-launch-hub**, next to the
+receiver it talks to (`src/routes/api/public/v1.infrastructure.ts`) and the
+schema that validates it (`src/lib/infrastructure/schema.ts`).
+
+It reads through this server's HTTP API and never opens `collector.db`.
+
+There was a second copy here. It has been removed: two senders against one
+contract drift apart, and the surviving one is the copy that sits beside the
+schema, so a change to either is visible in one place.
+
 ## Deploying
 
 ```bash
