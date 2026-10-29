@@ -203,3 +203,26 @@ class Limits(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EntityLag(unittest.TestCase):
+    """One observed_at covers the batch, so a host far behind it is left out."""
+
+    def test_a_host_far_behind_the_newest_is_not_carried_along(self):
+        rows = [measurement("fresh", collected=at(0)),
+                measurement("abandoned", collected=at(600))]
+        snap, _ = build(rows, "b-1", now=NOW)
+        self.assertEqual([e["id"] for e in snap["entities"]], ["fresh"])
+        self.assertTrue(any("behind the newest reading" in e for e in snap["errors"]))
+
+    def test_hosts_within_the_window_all_travel_together(self):
+        rows = [measurement("a", collected=at(0)), measurement("b", collected=at(2))]
+        snap, _ = build(rows, "b-1", now=NOW)
+        self.assertEqual(sorted(e["id"] for e in snap["entities"]), ["a", "b"])
+
+    def test_a_single_old_host_is_still_sent_and_flagged_stale(self):
+        # Nothing to be behind, so it goes; staleness is reported separately.
+        snap, report = build([measurement("only", collected=at(600))], "b-1", now=NOW)
+        self.assertEqual([e["id"] for e in snap["entities"]], ["only"])
+        self.assertEqual(snap["observed_at"], at(600))
+        self.assertGreater(report["age_seconds"], 3000)

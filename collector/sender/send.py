@@ -64,7 +64,8 @@ def now_utc():
 
 
 def log(message):
-    print(f"{iso(now_utc())}  {message}", flush=True)
+    """Progress goes to stderr so stdout carries only a --dry-run payload."""
+    print(f"{iso(now_utc())}  {message}", file=sys.stderr, flush=True)
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):

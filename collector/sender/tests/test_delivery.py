@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import urllib.error
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,10 +68,12 @@ class Base(unittest.TestCase):
             return outcome() if callable(outcome) else outcome
 
         send.post_snapshot = fake_post
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        # Progress goes to stderr and a --dry-run payload to stdout, so both
+        # are captured and returned together.
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             code = send.run_once(self.args(**overrides), KEY)
-        return code, buffer.getvalue()
+        return code, out.getvalue() + err.getvalue()
 
     def slot(self):
         state = load_state(self.state_file)

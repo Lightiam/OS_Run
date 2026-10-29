@@ -33,6 +33,12 @@ MAX_IDENTITY = 256
 STALE_AFTER = timedelta(hours=24)
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 
+# A snapshot carries one observed_at for the whole batch, so a host whose last
+# reading is far older than the newest would be recorded as seen now. The app
+# calls a host stale after 180s (connectionStatus in src/lib/infrastructure/
+# schema.ts), so anything that far behind the batch is left out instead.
+ENTITY_LAG_LIMIT = timedelta(seconds=180)
+
 METRIC_FIELDS = (
     "cpu_pct",
     "memory_used_bytes",
@@ -195,19 +201,25 @@ def build(measurements, batch_id, now=None):
     now = now or datetime.now(timezone.utc)
     best, no_host, no_time = latest_per_host(measurements)
 
+    # The batch is timestamped once, so decide its time before choosing who is
+    # in it: a host far behind the newest reading would otherwise be recorded
+    # as seen at the newest host's time.
+    newest = max((collected for collected, _ in best.values()), default=None)
+
     entities = []
-    newest = None
     without_metrics = 0
+    lagging = 0
 
     for hostname in sorted(best):
         collected, measurement = best[hostname]
+        if newest is not None and (newest - collected) > ENTITY_LAG_LIMIT:
+            lagging += 1
+            continue
         entity = build_entity(hostname, measurement)
         if entity is None:
             without_metrics += 1
             continue
         entities.append(entity)
-        if newest is None or collected > newest:
-            newest = collected
 
     problems = []
     if no_host:
@@ -216,6 +228,11 @@ def build(measurements, batch_id, now=None):
         problems.append(f"{no_time} measurement(s) had no usable collected_at and were not sent.")
     if without_metrics:
         problems.append(f"{without_metrics} host(s) had no usable metric and were not sent.")
+    if lagging:
+        problems.append(
+            f"{lagging} host(s) were more than {int(ENTITY_LAG_LIMIT.total_seconds())}s behind the "
+            "newest reading and were left out rather than recorded as seen now."
+        )
 
     truncated = False
     if len(entities) > MAX_ENTITIES:
