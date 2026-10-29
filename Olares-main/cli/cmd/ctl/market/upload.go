@@ -1,0 +1,235 @@
+package market
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/beclab/Olares/cli/pkg/cmdutil"
+)
+
+func NewCmdMarketUpload(f *cmdutil.Factory) *cobra.Command {
+	opts := newMarketOptions(f)
+	cmd := &cobra.Command{
+		Use:   "upload {chart-file-or-dir}",
+		Short: "Upload helm chart package(s) to the SPA's Local Sources → Upload bucket",
+		Long: `Upload Helm-style chart package(s) (.tgz or .tar.gz) to the market.
+If the path is a directory, every chart file in the directory is
+uploaded (subdirectories are not recursed).
+
+The target source is hard-coded to the SPA's "Local Sources → Upload"
+bucket (internal id 'upload'). The CLI used to expose -s/--source here,
+but every chart pushed from the CLI belongs in that same bucket —
+pinning it avoids the foot-gun where a chart uploaded to a different
+local source ('cli' / 'studio') was invisible to the SPA's Local Sources
+tab. To install / delete an uploaded chart, pair this with
+'olares-cli market install <app> -s upload' and
+'olares-cli market delete <app>' (also hard-coded to 'upload').
+
+Per-file results are summarized at the end; -o json emits a structured
+report with one entry per file (status / message). Exit code is
+non-zero if any file failed.
+
+Examples:
+  olares-cli market upload myapp-1.0.0.tgz
+  olares-cli market upload ./charts/
+  olares-cli market upload ./charts/ -o json    # structured per-file report
+  olares-cli market upload ./charts/ -q         # silent; exit code = aggregate verdict`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runUpload(opts, args[0])
+		},
+	}
+	opts.addOutputFlags(cmd)
+	return cmd
+}
+
+type uploadItemResult struct {
+	File    string `json:"file"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+type uploadArchitectureError struct {
+	Code                  string
+	ManifestArchitectures []string
+	ClusterArchitectures  []string
+}
+
+func (e *uploadArchitectureError) Error() string {
+	switch e.Code {
+	case "architecture_incompatible":
+		return fmt.Sprintf(
+			"upload rejected: manifest supports %v, cluster provides %v; update spec.supportArch and image platforms, repackage, and do not retry the unchanged package",
+			e.ManifestArchitectures,
+			e.ClusterArchitectures,
+		)
+	case "cluster_arch_unavailable":
+		return "upload blocked: cluster node discovery is unavailable; keep the current package and version, then retry after node discovery recovers"
+	default:
+		return "upload architecture validation failed"
+	}
+}
+
+func isChartFile(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar.gz")
+}
+
+func runUpload(opts *MarketOptions, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return opts.failOp("upload", path, fmt.Errorf("cannot access '%s': %w", path, err))
+	}
+
+	mc, err := opts.prepare()
+	if err != nil {
+		return opts.failOp("upload", path, err)
+	}
+
+	// Source is hard-coded to the SPA-compatible "upload" bucket; see
+	// chartUploadSource in common.go for why we no longer expose -s here.
+	source := chartUploadSource
+
+	if info.IsDir() {
+		return uploadDir(opts, mc, path, source)
+	}
+
+	if !isChartFile(info.Name()) {
+		return opts.failOp("upload", path, fmt.Errorf("unsupported file format: expected .tgz or .tar.gz"))
+	}
+	return uploadFile(opts, mc, path, source)
+}
+
+func uploadDir(opts *MarketOptions, mc *MarketClient, dir, source string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return opts.failOp("upload", dir, fmt.Errorf("failed to read directory: %w", err))
+	}
+
+	var charts []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if isChartFile(e.Name()) {
+			charts = append(charts, filepath.Join(dir, e.Name()))
+		}
+	}
+
+	if len(charts) == 0 {
+		return opts.failOp("upload", dir, fmt.Errorf("no chart files (.tgz / .tar.gz) found in '%s'", dir))
+	}
+
+	opts.info("Found %d chart(s) in '%s'", len(charts), dir)
+
+	var failed int
+	results := make([]uploadItemResult, 0, len(charts))
+	for i, f := range charts {
+		opts.info("[%d/%d] Uploading %s ...", i+1, len(charts), filepath.Base(f))
+		if err := doUploadFile(opts, mc, f, source); err != nil {
+			results = append(results, uploadItemResult{
+				File:    filepath.Base(f),
+				Status:  "failed",
+				Message: err.Error(),
+			})
+			opts.info("  ERROR: %v", err)
+			failed++
+			continue
+		}
+		results = append(results, uploadItemResult{
+			File:   filepath.Base(f),
+			Status: "success",
+		})
+	}
+
+	if opts.Quiet {
+		if failed > 0 {
+			return errReported
+		}
+		return nil
+	}
+
+	if opts.isJSON() {
+		// The per-file report is the output either way; what a caller in a
+		// pipeline reads is the exit code, so it has to agree with the quiet
+		// and table branches rather than reporting the encode alone.
+		if err := opts.printJSON(results); err != nil {
+			return err
+		}
+		if failed > 0 {
+			return errReported
+		}
+		return nil
+	}
+
+	if failed > 0 {
+		fmt.Fprintf(os.Stderr, "upload '%s': %d of %d uploads failed\n", dir, failed, len(charts))
+		return errReported
+	}
+	fmt.Fprintf(os.Stdout, "upload '%s': all %d chart(s) uploaded\n", dir, len(charts))
+	return nil
+}
+
+func uploadFile(opts *MarketOptions, mc *MarketClient, filePath, source string) error {
+	if err := doUploadFile(opts, mc, filePath, source); err != nil {
+		return opts.failOp("upload", filepath.Base(filePath), err)
+	}
+	result := OperationResult{
+		App:       filepath.Base(filePath),
+		Operation: "upload",
+		Status:    "success",
+		Message:   "chart uploaded",
+		Source:    source,
+	}
+	if !opts.Quiet {
+		opts.printResult(result)
+	}
+	return nil
+}
+
+func doUploadFile(opts *MarketOptions, mc *MarketClient, filePath, source string) error {
+	absPath, _ := filepath.Abs(filePath)
+	// Name the target user the way install / upgrade / uninstall do. Upload
+	// is the verb most likely to be run right after `profile use`, and it
+	// was the only write verb whose output gave no clue which Olares it
+	// landed on — the uploader only showed up in a later `market get` dump.
+	opts.info("Uploading '%s' to source '%s' for user '%s'...", filepath.Base(absPath), source, mc.olaresID)
+	ctx := context.Background()
+	response, err := mc.UploadChart(ctx, absPath, source)
+	if err != nil {
+		if architectureErr := parseUploadArchitectureError(response); architectureErr != nil {
+			return architectureErr
+		}
+		return fmt.Errorf("upload failed: %w", err)
+	}
+	return nil
+}
+
+func parseUploadArchitectureError(response *APIResponse) error {
+	if response == nil {
+		return nil
+	}
+	switch response.Code {
+	case "cluster_arch_unavailable":
+		return &uploadArchitectureError{Code: response.Code}
+	case "architecture_incompatible":
+		var data struct {
+			ManifestArchitectures []string `json:"manifest_architectures"`
+			ClusterArchitectures  []string `json:"cluster_architectures"`
+		}
+		_ = json.Unmarshal(response.Data, &data)
+		return &uploadArchitectureError{
+			Code:                  response.Code,
+			ManifestArchitectures: data.ManifestArchitectures,
+			ClusterArchitectures:  data.ClusterArchitectures,
+		}
+	default:
+		return nil
+	}
+}

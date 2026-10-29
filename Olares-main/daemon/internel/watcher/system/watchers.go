@@ -1,0 +1,183 @@
+package system
+
+import (
+	"context"
+	"sync"
+
+	"github.com/beclab/Olares/daemon/internel/watcher"
+	"github.com/beclab/Olares/daemon/pkg/cluster/state"
+	changeip "github.com/beclab/Olares/daemon/pkg/commands/change_ip"
+	"github.com/beclab/Olares/daemon/pkg/commands/uninstall"
+	"github.com/beclab/Olares/daemon/pkg/nets"
+	"github.com/beclab/Olares/daemon/pkg/utils"
+	"k8s.io/klog/v2"
+)
+
+var _ watcher.Watcher = &systemWatcher{}
+var _ watcher.Watcher = &autoRepair{}
+
+type systemWatcher struct {
+	watcher.Watcher
+}
+
+func NewSystemWatcher() *systemWatcher {
+	w := &systemWatcher{}
+	return w
+}
+
+func (w *systemWatcher) Watch(ctx context.Context) {
+	switch state.CurrentState.TerminusState {
+	case state.InvalidIpAddress, state.IPChangeFailed:
+		// change ip automatically
+		cmd := changeip.New()
+		_, err := cmd.Execute(ctx, nil)
+		if err != nil {
+			klog.Error("change ip error, ", err)
+		}
+	case state.IPChanging, state.Installing, state.Uninstalling,
+		state.Upgrading, state.Restarting, state.NetworkNotReady:
+		// do nothing, wait for the operation to finish
+	default:
+		client, err := utils.GetKubeClient()
+		if err != nil {
+			klog.V(8).ErrorS(err, "failed to get kube client")
+			// k8s client is not ready, skip the check
+			return
+		}
+
+		masterIp, err := utils.GetMasterNodeIpInCluster(ctx, client)
+		if err != nil {
+			klog.V(8).ErrorS(err, "failed to get master node IP")
+			// master node IP is not available, skip the check
+			return
+		}
+
+		masterIpInHosts, err := nets.GetHostIpFromHostsFile(nets.MASTER_NODE_HOSTNAME)
+		if err != nil {
+			klog.ErrorS(err, "failed to get master node IP from hosts file")
+			// master node IP is not available in hosts file, skip the check
+			return
+		}
+
+		if masterIp != masterIpInHosts {
+			klog.Info("master node IP is invalid, updating hosts file")
+			err := nets.WriteIpToHostsFile(masterIp, nets.MASTER_NODE_HOSTNAME)
+			if err != nil {
+				klog.ErrorS(err, "failed to update hosts file with new master node IP")
+				return
+			}
+			klog.Info("hosts file updated with new master node IP")
+		}
+	}
+}
+
+type autoRepair struct {
+	watcher.Watcher
+}
+
+func NewAutoRepair() *autoRepair {
+	return &autoRepair{}
+}
+
+func (w *autoRepair) Watch(ctx context.Context) {
+	switch state.CurrentState.TerminusState {
+	case state.InstallFailed:
+		klog.Info("previous olares installation failed, uninstall it to repair now")
+		cmd := uninstall.New()
+		_, err := cmd.Execute(ctx, nil)
+		if err != nil {
+			klog.Error("auto uninstall error, ", err)
+		}
+	}
+}
+
+type bridgeConnectionWatcher struct {
+	watcher.Watcher
+	mu     sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewOverlayParentWatcher watches the carrier of the wired NIC that carries the
+// overlay gateway while the gateway is enabled.
+func NewOverlayParentWatcher() *bridgeConnectionWatcher {
+	return &bridgeConnectionWatcher{}
+}
+
+func (w *bridgeConnectionWatcher) Watch(ctx context.Context) {
+	device := ""
+	if utils.OverlayGatewayDesired() {
+		if dev, err := utils.ResolveOverlayParent(ctx); err != nil {
+			klog.V(4).Infof("overlay parent %s not resolvable yet: %v", utils.OverlayParentAltname, err)
+		} else {
+			device = dev
+		}
+	}
+	if device == "" {
+		// overlay gateway is off or its parent is gone, stop watching
+		w.mu.Lock()
+		if w.cancel != nil {
+			w.cancel()
+			w.cancel = nil
+			w.ctx = nil
+		}
+		w.mu.Unlock()
+	} else {
+		w.mu.Lock()
+		if w.ctx != nil {
+			w.mu.Unlock()
+			return
+		}
+		// overlay gateway is on, start watching its parent
+		w.ctx, w.cancel = context.WithCancel(context.Background())
+		watchCtx := w.ctx
+		w.mu.Unlock()
+
+		klog.Infof("start watching network carrier changes for overlay parent %s", device)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					klog.Errorf("overlay parent carrier watch panic recovered: %v", r)
+				}
+				w.mu.Lock()
+				w.cancel = nil
+				w.ctx = nil
+				w.mu.Unlock()
+			}()
+
+			err := utils.ListenNetworkCarrierChanges(watchCtx, device, func() {
+				// disable the overlay gateway supported apps' option for all users
+				apps, err := utils.GetOverlayGatewaySupportedApps(ctx, "")
+				if err != nil {
+					klog.Error("get overlay gateway supported apps error, ", err)
+					return
+				}
+
+				// network carrier down, disable overlay gateway enabled apps
+				for _, app := range apps {
+					if app.Enabled {
+						// set the app's option to disable overlay gateway
+						err = utils.UpdateApplicationSettings(ctx, app.AppResourceName, "enableOverlayGateway", "false")
+						if err != nil {
+							klog.Error("disable overlay gateway supported app error, ", err)
+							return
+						}
+					}
+				}
+
+				// restart the overlay gateway supported apps
+				// call restarting from the frontend
+				go func() {
+					err = utils.RestartOverlayGatewaySupportedApps(ctx, apps)
+					if err != nil {
+						klog.Error("restart overlay gateway supported apps error, ", err)
+					}
+				}()
+			})
+
+			if err != nil {
+				klog.Error("listen network carrier changes error, ", err)
+			}
+		}()
+	}
+}

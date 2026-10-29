@@ -1,0 +1,134 @@
+package cluster
+
+import (
+	"github.com/beclab/Olares/cli/pkg/bootstrap/patch"
+	"github.com/beclab/Olares/cli/pkg/common"
+	"github.com/beclab/Olares/cli/pkg/core/module"
+	"github.com/beclab/Olares/cli/pkg/gpu"
+	"github.com/beclab/Olares/cli/pkg/gpu/amdgpu"
+	"github.com/beclab/Olares/cli/pkg/gpu/intelgpu"
+	"github.com/beclab/Olares/cli/pkg/gpu/mtgpu"
+	"github.com/beclab/Olares/cli/pkg/kubesphere/plugins"
+	"github.com/beclab/Olares/cli/pkg/manifest"
+	"github.com/beclab/Olares/cli/pkg/preinstall"
+	"github.com/beclab/Olares/cli/pkg/storage"
+	"github.com/beclab/Olares/cli/pkg/terminus"
+)
+
+type linuxInstallPhaseBuilder struct {
+	runtime     *common.KubeRuntime
+	manifestMap manifest.InstallationManifest
+}
+
+func (l *linuxInstallPhaseBuilder) base() phase {
+	m := []module.Module{
+		&plugins.CopyEmbed{},
+		&terminus.CheckPreparedModule{Force: true},
+	}
+
+	return m
+}
+
+func (l *linuxInstallPhaseBuilder) storage() phase {
+	return []module.Module{
+		&storage.InstallRedisModule{
+			ManifestModule: manifest.ManifestModule{
+				Manifest: l.manifestMap,
+				BaseDir:  l.runtime.GetBaseDir(),
+			},
+		},
+		&storage.InstallJuiceFsModule{
+			ManifestModule: manifest.ManifestModule{
+				Manifest: l.manifestMap,
+				BaseDir:  l.runtime.GetBaseDir(),
+			},
+		},
+	}
+}
+
+func (l *linuxInstallPhaseBuilder) installCluster() phase {
+	kubeType := l.runtime.Arg.Kubetype
+	if kubeType == common.K3s {
+		return NewK3sCreateClusterPhase(l.runtime, l.manifestMap)
+	} else {
+		return NewCreateClusterPhase(l.runtime, l.manifestMap)
+	}
+}
+
+func (l *linuxInstallPhaseBuilder) installGpuPlugin() phase {
+	var skipGpuPlugin = !l.runtime.Arg.GPU.Enable
+	if l.runtime.GetSystemInfo().IsWsl() {
+		skipGpuPlugin = false
+	}
+	return []module.Module{
+		&gpu.RestartK3sServiceModule{Skip: !(l.runtime.Arg.Kubetype == common.K3s)},
+		&gpu.InstallPluginModule{Skip: skipGpuPlugin},
+		&amdgpu.InstallAmdPluginModule{Skip: func() bool {
+			si := l.runtime.GetSystemInfo()
+			if si.IsRyzenAIMax() || si.IsAmdGPU() {
+				return false
+			}
+			return true
+		}()},
+		&mtgpu.InstallMThreadsPluginModule{Skip: func() bool {
+			if l.runtime.GetSystemInfo().IsMThreadsM1000() {
+				return false
+			}
+			return true
+		}()},
+		&intelgpu.InstallIntelPluginModule{Skip: func() bool {
+			si := l.runtime.GetSystemInfo()
+			if si.IsIntelGPU() || si.IsIntelDGPU() {
+				return false
+			}
+			return true
+		}()},
+	}
+}
+
+func (l *linuxInstallPhaseBuilder) installTerminus() phase {
+	return []module.Module{
+		&terminus.GetNATGatewayIPModule{},
+		&terminus.InstallGenericDevicePluginModule{},
+		&terminus.InstallAccountModule{},
+		&terminus.InstallSettingsModule{},
+		&terminus.InstallOsSystemModule{},
+		// WSL shares this builder but is not a preinstall target: its system
+		// phase publishes no declaration, so a materialized cache would have
+		// nothing to serve.
+		&preinstall.HFCacheMaterializeModule{Skip: l.runtime.Arg.SystemInfo.IsWsl()},
+		&terminus.InstallLauncherModule{},
+		&terminus.InstallAppsModule{},
+	}
+}
+
+func (l *linuxInstallPhaseBuilder) installBackup() phase {
+	return []module.Module{
+		&terminus.InstallVeleroModule{
+			ManifestModule: manifest.ManifestModule{
+				Manifest: l.manifestMap,
+				BaseDir:  l.runtime.GetBaseDir(),
+			},
+		},
+	}
+}
+
+func (l *linuxInstallPhaseBuilder) build() []module.Module {
+	return l.base().
+		addModule(fsModuleBuilder(func() []module.Module {
+			return l.storage()
+		}).withJuiceFS(l.runtime)...).
+		addModule(&patch.CorrectHostnameModule{}).
+		addModule(&patch.PatchNfsScriptModule{}).
+		addModule(l.installCluster()...).
+		addModule(gpuModuleBuilder(func() []module.Module {
+			return l.installGpuPlugin()
+		}).withGPU(l.runtime)...).
+		addModule(l.installTerminus()...).
+		addModule(backupModuleBuilder(func() []module.Module {
+			return l.installBackup()
+		}).withBackup(l.runtime)...).
+		addModule(&terminus.InstalledModule{}).
+		addModule(&terminus.WriteReleaseFileModule{}).
+		addModule(&terminus.WelcomeModule{})
+}

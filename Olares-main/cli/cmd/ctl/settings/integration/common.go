@@ -1,0 +1,133 @@
+// Package integration hosts `olares-cli settings integration`. Mirrors
+// the SPA's Settings -> Integration page (S3 / Dropbox / Google Drive /
+// Tencent COS / Olares Space accounts). Backed by user-service's
+// account.controller.ts, all routes wrapped with returnSucceed/returnError,
+// so the CLI sees a uniform BFL envelope.
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/beclab/Olares/cli/pkg/bflenvelope"
+	"github.com/beclab/Olares/cli/pkg/cmdutil"
+	"github.com/beclab/Olares/cli/pkg/credential"
+	"github.com/beclab/Olares/cli/pkg/whoami"
+)
+
+type Format string
+
+const (
+	FormatTable Format = "table"
+	FormatJSON  Format = "json"
+)
+
+func parseFormat(s string) (Format, error) {
+	v := strings.ToLower(strings.TrimSpace(s))
+	switch v {
+	case "", string(FormatTable):
+		return FormatTable, nil
+	case string(FormatJSON):
+		return FormatJSON, nil
+	default:
+		return "", fmt.Errorf("unsupported --output %q (allowed: table, json)", s)
+	}
+}
+
+func addOutputFlag(cmd *cobra.Command, target *string) {
+	cmd.Flags().StringVarP(target, "output", "o", "table", "output format: table, json")
+}
+
+type Doer interface {
+	DoJSON(ctx context.Context, method, path string, body, out interface{}) error
+}
+
+type preparedClient struct {
+	profile *credential.ResolvedProfile
+	doer    Doer
+}
+
+func resolveClient(
+	ctx context.Context,
+	f *cmdutil.Factory,
+	pickBase func(*credential.ResolvedProfile) string,
+) (*preparedClient, error) {
+	if f == nil {
+		return nil, fmt.Errorf("internal error: settings integration not wired with cmdutil.Factory")
+	}
+	rp, err := f.ResolveProfile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hc, err := f.HTTPClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	base := pickBase(rp)
+	if base == "" {
+		return nil, fmt.Errorf("profile %q has no URL for this endpoint; re-run `olares-cli profile login`", rp.Name)
+	}
+	return &preparedClient{
+		profile: rp,
+		doer:    whoami.NewHTTPClient(hc, base, rp.OlaresID),
+	}, nil
+}
+
+func prepare(ctx context.Context, f *cmdutil.Factory) (*preparedClient, error) {
+	return resolveClient(ctx, f, func(rp *credential.ResolvedProfile) string {
+		return rp.DesktopURL
+	})
+}
+
+// prepareSettings targets the settings host. The account routes live on
+// the desktop host, but /api/cookie/* is only exposed here — the same
+// origin the Settings SPA writes cookies through.
+func prepareSettings(ctx context.Context, f *cmdutil.Factory) (*preparedClient, error) {
+	return resolveClient(ctx, f, func(rp *credential.ResolvedProfile) string {
+		return rp.SettingsURL
+	})
+}
+
+func doGetEnvelope(ctx context.Context, d Doer, path string, out interface{}) error {
+	return doMutateEnvelope(ctx, d, "GET", path, nil, out)
+}
+
+// doMutateEnvelope is the POST/PUT/DELETE counterpart of doGetEnvelope.
+// account.controller.ts wraps every route in returnSucceed/returnError,
+// so reads and writes share the same {code, message, data} envelope.
+func doMutateEnvelope(ctx context.Context, d Doer, method, path string, body, out interface{}) error {
+	var env bflenvelope.Envelope
+	if err := d.DoJSON(ctx, method, path, body, &env); err != nil {
+		return err
+	}
+	return bflenvelope.Data(method, path, env, out)
+}
+
+func printJSON(w io.Writer, v interface{}) error {
+	if w == nil {
+		w = os.Stdout
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func nonEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}

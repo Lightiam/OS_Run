@@ -1,0 +1,22 @@
+FROM golang:1.24.11 AS builder
+
+WORKDIR /workspace
+
+COPY go.mod bytetrade.io/web3os/l4-bfl-proxy/
+COPY go.sum bytetrade.io/web3os/l4-bfl-proxy/
+RUN cd bytetrade.io/web3os/l4-bfl-proxy && \
+    go mod download
+
+COPY cmd/ bytetrade.io/web3os/l4-bfl-proxy/cmd/
+COPY internal/ bytetrade.io/web3os/l4-bfl-proxy/internal/
+
+
+RUN cd bytetrade.io/web3os/l4-bfl-proxy/ && \
+    CGO_ENABLED=0 go build -o l4-bfl-proxy ./cmd/
+
+FROM beclab/envoyproxy-envoy:v1.38-latest
+WORKDIR /
+
+COPY --from=builder /workspace/bytetrade.io/web3os/l4-bfl-proxy/l4-bfl-proxy .
+
+ENTRYPOINT ["/l4-bfl-proxy"]

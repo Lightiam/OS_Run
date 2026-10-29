@@ -1,0 +1,39 @@
+name: Push deps to S3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+
+
+      # test
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: "us-east-1"
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          bash build/deps-manifest.sh && bash build/upload-deps.sh
+
+  push-arm64:
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+
+      # test
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: "us-east-1"
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          export PATH=$PATH:/usr/local/bin:/home/ubuntu/.local/bin
+          bash build/deps-manifest.sh linux/arm64 && bash build/upload-deps.sh linux/arm64

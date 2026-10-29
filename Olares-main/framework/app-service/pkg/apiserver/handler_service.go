@@ -1,0 +1,323 @@
+package apiserver
+
+import (
+	"encoding/json"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/beclab/Olares/framework/app-service/pkg/apiserver/api"
+	"github.com/beclab/Olares/framework/app-service/pkg/appcfg"
+	"github.com/beclab/Olares/framework/app-service/pkg/appstate"
+	"github.com/beclab/Olares/framework/app-service/pkg/client/clientset"
+	"github.com/beclab/Olares/framework/app-service/pkg/constants"
+	"github.com/beclab/Olares/framework/app-service/pkg/users/userspace"
+	apputils "github.com/beclab/Olares/framework/app-service/pkg/utils/app"
+	appv1alpha1 "github.com/beclab/api/api/app.bytetrade.io/v1alpha1"
+
+	"github.com/emicklei/go-restful/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+)
+
+func (h *Handler) list(req *restful.Request, resp *restful.Response) {
+	client := req.Attribute(constants.KubeSphereClientAttribute).(*clientset.ClientSet)
+	owner := req.Attribute(constants.UserContextAttribute).(string)
+
+	vis, err := h.newListVisibilityCtx(req.Request.Context(), owner)
+	if err != nil {
+		api.HandleError(resp, req, err)
+		return
+	}
+
+	allApps, err := client.AppClient.AppV1alpha1().Applications().List(req.Request.Context(), metav1.ListOptions{})
+	if err != nil {
+		api.HandleError(resp, req, err)
+		return
+	}
+
+	// Filter Applications using the unified visibility check: legacy
+	// owner-by-namespace for v1/v2, visible to all users for v3 / shared apps.
+	// For v3 apps, overlay Spec.UserSettings[owner] on Spec.Settings/Entrances
+	// so the caller sees their own customDomain/policy/authLevel choices.
+	var filteredApps []appv1alpha1.Application
+	for i := range allApps.Items {
+		a := allApps.Items[i]
+		if !vis.VisibleApp(&a) {
+			continue
+		}
+
+		a.Spec.Settings = a.EffectiveSettings(owner)
+		a.Spec.Entrances = a.EffectiveEntrances(owner)
+
+		filteredApps = append(filteredApps, a)
+	}
+
+	// get pending app's from app managers
+	//var pendingApplications []appv1alpha1.Application
+	appMgrs, err := client.AppClient.AppV1alpha1().ApplicationManagers().List(req.Request.Context(), metav1.ListOptions{})
+	if err != nil {
+		api.HandleError(resp, req, err)
+		return
+	}
+	for _, am := range appMgrs.Items {
+		var appconfig appcfg.ApplicationConfig
+		err = json.Unmarshal([]byte(am.Spec.Config), &appconfig)
+		if err != nil {
+			api.HandleError(resp, req, err)
+			return
+		}
+		if vis.VisibleAM(&am) && am.Status.State == appv1alpha1.Pending {
+			app := appv1alpha1.Application{
+				TypeMeta: metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              am.Name,
+					CreationTimestamp: metav1.Now(),
+				},
+				Spec: appv1alpha1.ApplicationSpec{
+					Name:            am.Spec.AppName,
+					RawAppName:      am.Spec.RawAppName,
+					Appid:           appcfg.AppName(am.Spec.AppName).GetAppID(),
+					IsSysApp:        appcfg.AppName(am.Spec.AppName).IsSysApp(),
+					Namespace:       am.Spec.AppNamespace,
+					Owner:           owner,
+					Entrances:       appconfig.Entrances,
+					SharedEntrances: appconfig.SharedEntrances,
+					Icon:            appconfig.Icon,
+				},
+			}
+			filteredApps = append(filteredApps, app)
+		}
+	}
+
+	// sort by create time desc
+	sort.Slice(filteredApps, func(i, j int) bool {
+		return filteredApps[i].CreationTimestamp.Before(&filteredApps[j].CreationTimestamp)
+	})
+
+	resp.WriteAsJson(filteredApps)
+}
+
+func (h *Handler) listBackend(req *restful.Request, resp *restful.Response) {
+	owner := req.PathParameter(ParamUserName)
+	isSysApp := req.QueryParameter("issysapp")
+	state := req.QueryParameter("state")
+
+	ss := make([]string, 0)
+	if state != "" {
+		ss = strings.Split(state, "|")
+	}
+	all := make([]string, 0)
+	for _, a := range appstate.All {
+		all = append(all, a.String())
+	}
+	stateSet := sets.NewString(all...)
+	if len(ss) > 0 {
+		stateSet = sets.String{}
+	}
+	for _, s := range ss {
+		stateSet.Insert(s)
+	}
+	filteredApps := make([]appv1alpha1.Application, 0)
+	appsMap := make(map[string]*appv1alpha1.Application)
+	appsEntranceMap := make(map[string]*appv1alpha1.Application)
+
+	ams, err := h.appmgrLister.List(labels.Everything())
+	if err != nil {
+		klog.Infof("get app manager list failed %v", err)
+		api.HandleError(resp, req, err)
+		return
+	}
+
+	vis, err := h.newListVisibilityCtx(req.Request.Context(), owner)
+	if err != nil {
+		api.HandleError(resp, req, err)
+		return
+	}
+
+	sharedEntranceApps := make(map[string]*appv1alpha1.Application)
+	for _, am := range ams {
+		if am.Spec.Type != appv1alpha1.App {
+			continue
+		}
+		if len(isSysApp) > 0 && isSysApp == "true" {
+			continue
+		}
+		if userspace.IsSysApp(am.Spec.AppName) {
+			continue
+		}
+		if !stateSet.Has(am.Status.State.String()) {
+			continue
+		}
+
+		var appconfig appcfg.ApplicationConfig
+		err = json.Unmarshal([]byte(am.Spec.Config), &appconfig)
+		if err != nil {
+			api.HandleError(resp, req, err)
+			return
+		}
+		for i := range appconfig.Entrances {
+			if appconfig.Entrances[i].AuthLevel == "" {
+				appconfig.Entrances[i].AuthLevel = "private"
+			}
+		}
+
+		appconfig.SharedEntrances, err = appconfig.GenSharedEntranceURL(req.Request.Context())
+		if err != nil {
+			api.HandleError(resp, req, err)
+			return
+		}
+
+		// Visibility for non-owners:
+		//   • Shared apps: always visible (vis.VisibleSharedApp == true).
+		//   • Per-user apps (v1 and v3+per-user): legacy SharedEntrances
+		//     feature (untouched).
+		if am.Spec.AppOwner != owner {
+			if appcfg.IsShared(am) {
+				if !vis.VisibleSharedApp(am.Spec.AppName) {
+					continue
+				}
+			} else if len(appconfig.SharedEntrances) == 0 {
+				continue
+			}
+		}
+
+		now := metav1.Now()
+		name, _ := apputils.FmtAppMgrName(am.Spec.AppName, owner, appconfig.Namespace)
+		// Mirror the AM's clone-origin label onto the synthesized ("fake")
+		// Application so callers see it before the real Application CR exists.
+		appLabels := map[string]string{}
+		if v, ok := am.Labels[constants.AppClonedFromKey]; ok {
+			appLabels[constants.AppClonedFromKey] = v
+		}
+		if v, ok := am.Labels[constants.AppChartOwnerKey]; ok {
+			appLabels[constants.AppChartOwnerKey] = v
+		}
+		app := &appv1alpha1.Application{
+			TypeMeta: metav1.TypeMeta{},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Labels:            appLabels,
+				CreationTimestamp: am.CreationTimestamp,
+			},
+			Spec: appv1alpha1.ApplicationSpec{
+				Name:            am.Spec.AppName,
+				RawAppName:      am.Spec.RawAppName,
+				Appid:           appcfg.AppName(am.Spec.AppName).GetAppID(),
+				IsSysApp:        appcfg.AppName(am.Spec.AppName).IsSysApp(),
+				Namespace:       am.Spec.AppNamespace,
+				Owner:           am.Spec.AppOwner,
+				TailScale:       appconfig.TailScale,
+				Entrances:       appconfig.Entrances,
+				Ports:           appconfig.Ports,
+				SharedEntrances: appconfig.SharedEntrances,
+				Icon:            appconfig.Icon,
+				Settings: map[string]string{
+					"title":         am.Annotations[constants.ApplicationTitleLabel],
+					"market_source": am.Annotations[constants.AppMarketSourceKey],
+					"version":       am.Annotations[api.AppVersionKey],
+				},
+			},
+			Status: appv1alpha1.ApplicationStatus{
+				State:      am.Status.State.String(),
+				Progress:   am.Status.Progress,
+				StatusTime: &now,
+				UpdateTime: &now,
+			},
+		}
+
+		switch {
+		case appcfg.IsShared(am):
+			// Shared apps expose the full entrance list to every viewer;
+			// lifecycle handlers enforce admin-only management.
+			appsMap[app.Name] = app
+		case am.Spec.AppOwner != owner:
+			// Per-user non-owner: legacy SharedEntrances behaviour — only
+			// expose the shared subset, mask everything else.
+			app.Spec.Entrances = []appv1alpha1.Entrance{}
+			if _, ok := sharedEntranceApps[app.Spec.Appid]; !ok {
+				sharedEntranceApps[app.Spec.Appid] = app
+			}
+		default:
+			if len(appconfig.SharedEntrances) > 0 {
+				// force to set the shared entrance app with my app
+				sharedEntranceApps[app.Spec.Appid] = app
+			}
+			appsMap[app.Name] = app
+		}
+	}
+
+	// add shared entrance apps
+	for _, app := range sharedEntranceApps {
+		if _, ok := appsMap[app.Name]; ok {
+			continue
+		}
+		appsMap[app.Name] = app
+	}
+
+	allApps, err := h.appLister.List(labels.Everything())
+	if err != nil {
+		api.HandleError(resp, req, err)
+		return
+	}
+
+	for _, a := range allApps {
+		// Visibility for the underlying Application:
+		//   • owner equals viewer → legacy v1/v2 path,
+		//   • shared app + admin / granted viewer → v3 fan-out.
+		if !(a.Spec.Owner == owner || vis.VisibleApp(a)) {
+			continue
+		}
+		if len(isSysApp) > 0 && isSysApp == "true" && strconv.FormatBool(a.Spec.IsSysApp) != isSysApp {
+			continue
+		}
+		appsEntranceMap[a.Name] = a
+
+		if a.Spec.IsSysApp {
+			appsMap[a.Name] = a
+			continue
+		}
+		if v, ok := appsMap[a.Name]; ok {
+			// title and market_source come from AM annotations and may not
+			// be present in the Application CR's Settings. Fall back to the
+			// synthesized values so they are not lost on overwrite.
+			title := v.Spec.Settings["title"]
+			marketSource := v.Spec.Settings["market_source"]
+			version := v.Spec.Settings["version"]
+			v.Spec.Settings = a.EffectiveSettings(owner)
+			if v.Spec.Settings == nil {
+				v.Spec.Settings = map[string]string{}
+			}
+			if _, ok := v.Spec.Settings["title"]; !ok {
+				v.Spec.Settings["title"] = title
+			}
+			if _, ok := v.Spec.Settings["market_source"]; !ok {
+				v.Spec.Settings["market_source"] = marketSource
+			}
+			if v.Spec.Settings["version"] != version && version != "" {
+				v.Spec.Settings["version"] = version
+			}
+			v.Spec.Entrances = a.EffectiveEntrances(owner)
+			v.Spec.Ports = a.Spec.Ports
+			v.Labels = a.Labels
+		}
+	}
+	for _, app := range appsMap {
+		if v, ok := appsEntranceMap[app.Name]; ok {
+			app.Status.EntranceStatuses = v.Status.EntranceStatuses
+		}
+		filteredApps = append(filteredApps, *app)
+	}
+
+	// sort by create time desc
+	sort.Slice(filteredApps, func(i, j int) bool {
+		if !filteredApps[i].CreationTimestamp.Equal(&filteredApps[j].CreationTimestamp) {
+			return filteredApps[i].CreationTimestamp.Before(&filteredApps[j].CreationTimestamp)
+		}
+		return filteredApps[i].Spec.Name < filteredApps[j].Spec.Name
+	})
+
+	resp.WriteAsJson(filteredApps)
+}

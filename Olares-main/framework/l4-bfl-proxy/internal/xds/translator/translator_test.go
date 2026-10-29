@@ -1,0 +1,1296 @@
+package translator
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	mutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	headermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
+	rbacfilterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	earlyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/early_header_mutation/header_mutation/v3"
+	ppupstreamv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/proxy_protocol/v3"
+	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/beclab/l4-bfl-proxy/internal/ir"
+)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func asListener(t *testing.T, r interface{}) *listenerv3.Listener {
+	t.Helper()
+	l, ok := r.(*listenerv3.Listener)
+	require.True(t, ok, "expected *listenerv3.Listener")
+	return l
+}
+
+func asCluster(t *testing.T, r interface{}) *clusterv3.Cluster {
+	t.Helper()
+	c, ok := r.(*clusterv3.Cluster)
+	require.True(t, ok, "expected *clusterv3.Cluster")
+	return c
+}
+
+func asRouteConfig(t *testing.T, r interface{}) *routev3.RouteConfiguration {
+	t.Helper()
+	rc, ok := r.(*routev3.RouteConfiguration)
+	require.True(t, ok, "expected *routev3.RouteConfiguration")
+	return rc
+}
+
+func hcmFromListener(t *testing.T, l *listenerv3.Listener) *hcmv3.HttpConnectionManager {
+	t.Helper()
+	require.NotEmpty(t, l.FilterChains)
+	require.NotEmpty(t, l.FilterChains[0].Filters)
+	hcm := &hcmv3.HttpConnectionManager{}
+	require.NoError(t, l.FilterChains[0].Filters[0].GetTypedConfig().UnmarshalTo(hcm))
+	return hcm
+}
+
+func headerMutationRemoves(t *testing.T, mutations []*mutationrulesv3.HeaderMutation) []string {
+	t.Helper()
+	out := make([]string, 0, len(mutations))
+	for _, m := range mutations {
+		require.NotEmpty(t, m.GetRemove())
+		out = append(out, m.GetRemove())
+	}
+	return out
+}
+
+func socketAddr(l *listenerv3.Listener) *corev3.SocketAddress {
+	return l.GetAddress().GetSocketAddress()
+}
+
+// ---------------------------------------------------------------------------
+// buildHTTPRedirectListener
+// ---------------------------------------------------------------------------
+
+func TestBuildHTTPRedirectListener(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "http_redirect_81",
+		Address:  "0.0.0.0",
+		Port:     81,
+		Protocol: ir.ProtocolHTTP,
+		HTTPRedirect: &ir.HTTPRedirectIR{
+			Scheme: "https",
+			Code:   301,
+		},
+	}
+
+	l := buildHTTPRedirectListener(irListener)
+
+	require.NotNil(t, l)
+	assert.Equal(t, "http_redirect_81", l.Name)
+	assert.Equal(t, "0.0.0.0", socketAddr(l).Address)
+	assert.Equal(t, uint32(81), socketAddr(l).GetPortValue())
+	require.Len(t, l.FilterChains, 1)
+	require.Len(t, l.FilterChains[0].Filters, 1)
+	assert.Equal(t, "envoy.filters.network.http_connection_manager", l.FilterChains[0].Filters[0].Name)
+}
+
+func TestBuildHTTPRedirectListener_NilRedirect(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "no_redirect",
+		Protocol: ir.ProtocolHTTP,
+	}
+
+	assert.Nil(t, buildHTTPRedirectListener(irListener))
+}
+
+func TestBuildHTTPRedirectListener_StreamIdleTimeout(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "http_redirect_81",
+		Address:  "0.0.0.0",
+		Port:     81,
+		Protocol: ir.ProtocolHTTP,
+		HTTPRedirect: &ir.HTTPRedirectIR{
+			Scheme: "https",
+			Code:   301,
+		},
+	}
+
+	l := buildHTTPRedirectListener(irListener)
+	require.NotNil(t, l)
+
+	require.Len(t, l.FilterChains, 1)
+	require.Len(t, l.FilterChains[0].Filters, 1)
+	filter := l.FilterChains[0].Filters[0]
+	hcm := &hcmv3.HttpConnectionManager{}
+	require.NoError(t, filter.GetTypedConfig().UnmarshalTo(hcm))
+
+	require.NotNil(t, hcm.GetStreamIdleTimeout())
+	assert.EqualValues(t, 1800, hcm.GetStreamIdleTimeout().GetSeconds())
+}
+
+// ---------------------------------------------------------------------------
+// buildTLSListener
+// ---------------------------------------------------------------------------
+
+func TestBuildTLSListener_Basic(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:         "tls_443",
+		Address:      "0.0.0.0",
+		Port:         443,
+		Protocol:     ir.ProtocolTLS,
+		TLSInspector: true,
+		Routes: []*ir.RouteIR{
+			{
+				Name:       "route_alice",
+				SNIMatches: []string{"alice.example.com", "*.alice.example.com"},
+				Destination: &ir.DestinationIR{
+					Name: "user_alice",
+					Host: "bfl.user-space-alice",
+					Port: 444,
+				},
+				ProxyProtocolUpstream: true,
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	l, clusters := buildTLSListener(irListener, clusterSet)
+
+	require.NotNil(t, l)
+	assert.Equal(t, "tls_443", l.Name)
+	assert.Equal(t, uint32(443), socketAddr(l).GetPortValue())
+
+	require.Len(t, l.ListenerFilters, 1)
+	assert.Equal(t, "envoy.filters.listener.tls_inspector", l.ListenerFilters[0].Name)
+
+	require.Len(t, l.FilterChains, 1)
+	fc := l.FilterChains[0]
+	assert.Equal(t, "route_alice", fc.Name)
+	assert.Equal(t, []string{"alice.example.com", "*.alice.example.com"}, fc.FilterChainMatch.ServerNames)
+
+	require.Len(t, clusters, 1)
+	c := asCluster(t, clusters[0])
+	assert.Equal(t, "user_alice", c.Name)
+	assert.True(t, clusterSet["user_alice"])
+}
+
+func TestBuildTLSListener_ProxyProtocol(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:          "tls_444",
+		Address:       "0.0.0.0",
+		Port:          444,
+		Protocol:      ir.ProtocolTLS,
+		ProxyProtocol: true,
+		TLSInspector:  true,
+		Routes: []*ir.RouteIR{
+			{
+				Name:       "route_alice",
+				SNIMatches: []string{"alice.example.com"},
+				Destination: &ir.DestinationIR{
+					Name: "user_alice",
+					Host: "bfl.user-space-alice",
+					Port: 444,
+				},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	l, _ := buildTLSListener(irListener, clusterSet)
+
+	require.Len(t, l.ListenerFilters, 2)
+	assert.Equal(t, "envoy.filters.listener.proxy_protocol", l.ListenerFilters[0].Name)
+	assert.Equal(t, "envoy.filters.listener.tls_inspector", l.ListenerFilters[1].Name)
+}
+
+func TestBuildTLSListener_DenyAll_SourceCIDR(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:         "tls_443",
+		Address:      "0.0.0.0",
+		Port:         443,
+		Protocol:     ir.ProtocolTLS,
+		TLSInspector: true,
+		Routes: []*ir.RouteIR{
+			{
+				Name:       "route_bob_allowed",
+				SNIMatches: []string{"app.bob.example.com"},
+				Destination: &ir.DestinationIR{
+					Name: "user_bob",
+					Host: "bfl.user-space-bob",
+					Port: 444,
+				},
+			},
+			{
+				Name:               "route_bob_restricted",
+				SNIMatches:         []string{"bob.example.com", "*.bob.example.com"},
+				SourcePrefixRanges: []string{"100.64.0.0/24", "192.168.1.100/32"},
+				Destination: &ir.DestinationIR{
+					Name: "user_bob",
+					Host: "bfl.user-space-bob",
+					Port: 444,
+				},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	l, clusters := buildTLSListener(irListener, clusterSet)
+
+	require.Len(t, l.FilterChains, 2)
+
+	fcAllowed := l.FilterChains[0]
+	assert.Equal(t, []string{"app.bob.example.com"}, fcAllowed.FilterChainMatch.ServerNames)
+	assert.Empty(t, fcAllowed.FilterChainMatch.SourcePrefixRanges)
+
+	fcRestricted := l.FilterChains[1]
+	assert.Equal(t, []string{"bob.example.com", "*.bob.example.com"}, fcRestricted.FilterChainMatch.ServerNames)
+	require.Len(t, fcRestricted.FilterChainMatch.SourcePrefixRanges, 2)
+	assert.Equal(t, "100.64.0.0", fcRestricted.FilterChainMatch.SourcePrefixRanges[0].AddressPrefix)
+	assert.Equal(t, uint32(24), fcRestricted.FilterChainMatch.SourcePrefixRanges[0].PrefixLen.GetValue())
+	assert.Equal(t, "192.168.1.100", fcRestricted.FilterChainMatch.SourcePrefixRanges[1].AddressPrefix)
+	assert.Equal(t, uint32(32), fcRestricted.FilterChainMatch.SourcePrefixRanges[1].PrefixLen.GetValue())
+
+	require.Len(t, clusters, 1)
+}
+
+func TestBuildTLSListener_ClusterDedup(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "tls_443",
+		Address:  "0.0.0.0",
+		Port:     443,
+		Protocol: ir.ProtocolTLS,
+		Routes: []*ir.RouteIR{
+			{
+				Name:       "route_a",
+				SNIMatches: []string{"a.example.com"},
+				Destination: &ir.DestinationIR{
+					Name: "same_cluster",
+					Host: "10.0.0.1",
+					Port: 443,
+				},
+			},
+			{
+				Name:       "route_b",
+				SNIMatches: []string{"b.example.com"},
+				Destination: &ir.DestinationIR{
+					Name: "same_cluster",
+					Host: "10.0.0.1",
+					Port: 443,
+				},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	_, clusters := buildTLSListener(irListener, clusterSet)
+	assert.Len(t, clusters, 1)
+}
+
+// ---------------------------------------------------------------------------
+// buildL4TCPListener / buildL4UDPListener
+// ---------------------------------------------------------------------------
+
+func TestBuildL4TCPListener(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "stream_tcp_48126",
+		Address:  "0.0.0.0",
+		Port:     48126,
+		Protocol: ir.ProtocolTCP,
+		Routes: []*ir.RouteIR{
+			{
+				Name: "direct_48126",
+				Destination: &ir.DestinationIR{
+					Name: "direct_alice_48126",
+					Host: "bfl.user-space-alice",
+					Port: 48126,
+				},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	l, clusters := buildL4TCPListener(irListener, clusterSet)
+
+	require.NotNil(t, l)
+	assert.Equal(t, "stream_tcp_48126", l.Name)
+	assert.Equal(t, uint32(48126), socketAddr(l).GetPortValue())
+	require.Len(t, l.FilterChains, 1)
+	assert.Equal(t, "direct_48126", l.FilterChains[0].Name)
+	assert.Empty(t, l.ListenerFilters)
+
+	require.Len(t, clusters, 1)
+	c := asCluster(t, clusters[0])
+	assert.Equal(t, "direct_alice_48126", c.Name)
+	assert.Equal(t, clusterv3.Cluster_STRICT_DNS, c.GetType())
+}
+
+func TestBuildL4UDPListener(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "stream_udp_51820",
+		Address:  "0.0.0.0",
+		Port:     51820,
+		Protocol: ir.ProtocolUDP,
+		Routes: []*ir.RouteIR{
+			{
+				Name: "direct_51820",
+				Destination: &ir.DestinationIR{
+					Name: "direct_alice_51820",
+					Host: "bfl.user-space-alice",
+					Port: 51820,
+				},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	l, clusters := buildL4UDPListener(irListener, clusterSet)
+
+	require.NotNil(t, l)
+	assert.Equal(t, "stream_udp_51820", l.Name)
+	sa := socketAddr(l)
+	assert.Equal(t, uint32(51820), sa.GetPortValue())
+	assert.Equal(t, corev3.SocketAddress_UDP, sa.Protocol)
+	assert.NotNil(t, l.UdpListenerConfig)
+
+	require.Len(t, l.ListenerFilters, 1)
+	assert.Equal(t, "envoy.filters.udp_listener.udp_proxy", l.ListenerFilters[0].Name)
+
+	require.Len(t, clusters, 1)
+}
+
+func TestBuildL4UDPListener_NoRoutes(t *testing.T) {
+	irListener := &ir.ListenerIR{
+		Name:     "empty_udp",
+		Protocol: ir.ProtocolUDP,
+	}
+	l, clusters := buildL4UDPListener(irListener, make(map[string]bool))
+	assert.Nil(t, l)
+	assert.Nil(t, clusters)
+}
+
+// ---------------------------------------------------------------------------
+// buildL4Cluster / buildL7Cluster
+// ---------------------------------------------------------------------------
+
+func TestBuildL4Cluster_Basic(t *testing.T) {
+	dest := &ir.DestinationIR{
+		Name: "user_alice",
+		Host: "bfl.user-space-alice",
+		Port: 444,
+	}
+
+	c := buildL4Cluster(dest, false)
+
+	assert.Equal(t, "user_alice", c.Name)
+	assert.Equal(t, clusterv3.Cluster_STRICT_DNS, c.GetType())
+	assert.Nil(t, c.TransportSocket, "no transport socket when proxyProtocolUpstream=false")
+
+	endpoints := c.LoadAssignment.Endpoints
+	require.Len(t, endpoints, 1)
+	require.Len(t, endpoints[0].LbEndpoints, 1)
+	ep := endpoints[0].LbEndpoints[0].GetEndpoint()
+	assert.Equal(t, "bfl.user-space-alice", ep.Address.GetSocketAddress().Address)
+	assert.Equal(t, uint32(444), ep.Address.GetSocketAddress().GetPortValue())
+}
+
+func TestBuildL4Cluster_ProxyProtocolUpstream(t *testing.T) {
+	dest := &ir.DestinationIR{
+		Name: "user_alice",
+		Host: "bfl.user-space-alice",
+		Port: 444,
+	}
+
+	c := buildL4Cluster(dest, true)
+
+	require.NotNil(t, c.TransportSocket)
+	assert.Equal(t, "envoy.transport_sockets.upstream_proxy_protocol", c.TransportSocket.Name)
+
+	ppUpstream := &ppupstreamv3.ProxyProtocolUpstreamTransport{}
+	require.NoError(t, c.TransportSocket.GetTypedConfig().UnmarshalTo(ppUpstream))
+	assert.Equal(t, corev3.ProxyProtocolConfig_V1, ppUpstream.Config.Version)
+	assert.Equal(t, "envoy.transport_sockets.raw_buffer", ppUpstream.TransportSocket.Name)
+}
+
+func TestBuildL7Cluster(t *testing.T) {
+	c := buildL7Cluster(&ir.ClusterIR{
+		Name:   "app_alice_vault_main",
+		Host:   "vault-svc.vault-alice.svc.cluster.local",
+		Port:   8080,
+		UseDNS: true,
+	})
+
+	assert.Equal(t, "app_alice_vault_main", c.Name)
+	assert.Equal(t, clusterv3.Cluster_STRICT_DNS, c.GetType())
+
+	ep := c.LoadAssignment.Endpoints[0].LbEndpoints[0].GetEndpoint()
+	assert.Equal(t, "vault-svc.vault-alice.svc.cluster.local", ep.Address.GetSocketAddress().Address)
+	assert.Equal(t, uint32(8080), ep.Address.GetSocketAddress().GetPortValue())
+}
+
+// ---------------------------------------------------------------------------
+// buildMultiUserHTTPSListener
+// ---------------------------------------------------------------------------
+
+func TestBuildMultiUserHTTPSListener(t *testing.T) {
+	clusterMap := map[string]*ir.ClusterIR{
+		"app_alice_vault_main": {
+			Name: "app_alice_vault_main", Host: "vault-svc.vault-alice.svc.cluster.local", Port: 8080, UseDNS: true,
+		},
+		"profile_service_alice": {
+			Name: "profile_service_alice", Host: "profile-service.user-space-alice.svc.cluster.local", Port: 3000, UseDNS: true,
+		},
+		"authelia_backend_alice": {
+			Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091, UseDNS: true,
+		},
+	}
+
+	httpListeners := []*ir.HTTPListenerIR{
+		{
+			Name:          "https_443_alice",
+			Address:       "0.0.0.0",
+			Port:          443,
+			TLS:           true,
+			ProxyProtocol: false,
+			SNIMatches:    []string{"alice.example.com", "*.alice.example.com"},
+			TLSCert:       &ir.SecretIR{Name: "main-tls-alice", CertData: "cert", KeyData: "key"},
+			UserName:      "alice",
+			VirtualHosts: []*ir.VirtualHostIR{
+				{
+					Name:    "profile_alice",
+					Domains: []string{"alice.example.com"},
+					Routes: []*ir.HTTPRouteIR{{
+						Name:       "profile_root_alice",
+						PathPrefix: "/",
+						Cluster:    "profile_service_alice",
+					}},
+				},
+				{
+					Name:    "app_alice_vault_main",
+					Domains: []string{"vault.alice.example.com"},
+					Routes: []*ir.HTTPRouteIR{{
+						Name:             "default_alice_vault_main",
+						PathPrefix:       "/",
+						Cluster:          "app_alice_vault_main",
+						WebSocketUpgrade: true,
+					}},
+				},
+			},
+			DefaultResponse: &ir.DirectResponseIR{Status: 421, Body: "not found", ContentType: "text/html"},
+			PingRoute:       true,
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	listener, routeConfigs, clusters := buildMultiUserHTTPSListener(443, false, httpListeners, clusterMap, clusterSet)
+
+	require.NotNil(t, listener)
+	assert.Equal(t, "https_443", listener.Name)
+	assert.Equal(t, uint32(443), socketAddr(listener).GetPortValue())
+
+	// Should have tls_inspector listener filter
+	require.Len(t, listener.ListenerFilters, 1)
+	assert.Equal(t, "envoy.filters.listener.tls_inspector", listener.ListenerFilters[0].Name)
+
+	// One filter chain for alice
+	require.Len(t, listener.FilterChains, 1)
+	fc := listener.FilterChains[0]
+	assert.Equal(t, "https_443_alice", fc.Name)
+	assert.Equal(t, []string{"alice.example.com", "*.alice.example.com"}, fc.FilterChainMatch.ServerNames)
+	require.NotNil(t, fc.TransportSocket)
+
+	// Route config
+	require.Len(t, routeConfigs, 1)
+	rc := asRouteConfig(t, routeConfigs[0])
+	assert.Equal(t, "https_443_alice_routes", rc.Name)
+	require.GreaterOrEqual(t, len(rc.VirtualHosts), 2)
+
+	// Clusters created
+	assert.True(t, len(clusters) >= 2)
+}
+
+// Two filter chains with identical SNI (e.g. the same custom domain configured
+// twice) must collapse to one so Envoy never rejects the listener for having
+// duplicate matching rules.
+func TestBuildMultiUserHTTPSListener_DuplicateSNIDropped(t *testing.T) {
+	mk := func() *ir.HTTPListenerIR {
+		return &ir.HTTPListenerIR{
+			Name:       "https_443_olaresid_custom_test-app-domain3_bytetrade_com",
+			Address:    "0.0.0.0",
+			Port:       443,
+			TLS:        true,
+			SNIMatches: []string{"test-app-domain3.bytetrade.com"},
+			TLSCert:    &ir.SecretIR{Name: "custom-tls", CertData: "cert", KeyData: "key"},
+			UserName:   "olaresid",
+			VirtualHosts: []*ir.VirtualHostIR{{
+				Name:    "vh",
+				Domains: []string{"test-app-domain3.bytetrade.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r", PathPrefix: "/", Cluster: ""}},
+			}},
+		}
+	}
+
+	httpListeners := []*ir.HTTPListenerIR{mk(), mk()}
+	clusterSet := make(map[string]bool)
+	listener, _, _ := buildMultiUserHTTPSListener(443, false, httpListeners, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.NotNil(t, listener)
+	require.Len(t, listener.FilterChains, 1)
+	assert.Equal(t, []string{"test-app-domain3.bytetrade.com"}, listener.FilterChains[0].FilterChainMatch.ServerNames)
+}
+
+// When the same SNI is claimed twice, the earliest-created config must win and
+// the later-created one must be dropped — regardless of slice order.
+func TestBuildMultiUserHTTPSListener_EarliestCreatedWins(t *testing.T) {
+	mk := func(name string, created time.Time) *ir.HTTPListenerIR {
+		return &ir.HTTPListenerIR{
+			Name:       name,
+			Port:       443,
+			TLS:        true,
+			SNIMatches: []string{"dup.example.com"},
+			TLSCert:    &ir.SecretIR{Name: "custom-tls", CertData: "cert", KeyData: "key"},
+			UserName:   "olaresid",
+			CreatedAt:  created,
+			VirtualHosts: []*ir.VirtualHostIR{{
+				Name:    "vh",
+				Domains: []string{"dup.example.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r", PathPrefix: "/"}},
+			}},
+		}
+	}
+
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// The later-created chain is listed FIRST to prove order doesn't decide it.
+	httpListeners := []*ir.HTTPListenerIR{mk("chain_new", recent), mk("chain_old", old)}
+	clusterSet := make(map[string]bool)
+	listener, _, _ := buildMultiUserHTTPSListener(443, false, httpListeners, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.NotNil(t, listener)
+	require.Len(t, listener.FilterChains, 1)
+	assert.Equal(t, "chain_old", listener.FilterChains[0].Name)
+}
+
+// Chains for distinct SNIs must all be preserved.
+func TestBuildMultiUserHTTPSListener_DistinctSNIKept(t *testing.T) {
+	mk := func(domain string) *ir.HTTPListenerIR {
+		return &ir.HTTPListenerIR{
+			Name:       "https_443_olaresid_custom_" + domain,
+			Port:       443,
+			TLS:        true,
+			SNIMatches: []string{domain},
+			TLSCert:    &ir.SecretIR{Name: "custom-tls", CertData: "cert", KeyData: "key"},
+			UserName:   "olaresid",
+			VirtualHosts: []*ir.VirtualHostIR{{
+				Name:    "vh",
+				Domains: []string{domain},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r", PathPrefix: "/"}},
+			}},
+		}
+	}
+
+	httpListeners := []*ir.HTTPListenerIR{mk("a.example.com"), mk("b.example.com")}
+	clusterSet := make(map[string]bool)
+	listener, _, _ := buildMultiUserHTTPSListener(443, false, httpListeners, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.NotNil(t, listener)
+	require.Len(t, listener.FilterChains, 2)
+}
+
+// Two virtual hosts inside the same route config sharing a domain (e.g. two
+// apps configured with the same custom third_level_domain) must not make Envoy
+// reject the whole RouteConfiguration. The first virtual host keeps the shared
+// domain; the second keeps only its own unique domains.
+func TestBuildMultiUserHTTPSListener_DuplicateDomainDeduped(t *testing.T) {
+	httpIR := &ir.HTTPListenerIR{
+		Name:       "https_443_onetest06_zone",
+		Address:    "0.0.0.0",
+		Port:       443,
+		TLS:        true,
+		SNIMatches: []string{"*.onetest06.olares.com", "onetest06.olares.com"},
+		TLSCert:    &ir.SecretIR{Name: "tls", CertData: "cert", KeyData: "key"},
+		UserName:   "onetest06",
+		VirtualHosts: []*ir.VirtualHostIR{
+			{
+				Name:    "app_onetest06_radarr",
+				Domains: []string{"radarr.onetest06.olares.com", "test.onetest06.olares.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r1", PathPrefix: "/", Cluster: ""}},
+			},
+			{
+				Name:    "app_onetest06_sonarr",
+				Domains: []string{"sonarr.onetest06.olares.com", "test.onetest06.olares.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r2", PathPrefix: "/", Cluster: ""}},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	_, routeConfigs, _ := buildMultiUserHTTPSListener(443, false, []*ir.HTTPListenerIR{httpIR}, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.Len(t, routeConfigs, 1)
+	rc := asRouteConfig(t, routeConfigs[0])
+
+	domainsByVH := map[string][]string{}
+	seen := map[string]int{}
+	for _, vh := range rc.VirtualHosts {
+		domainsByVH[vh.Name] = vh.Domains
+		for _, d := range vh.Domains {
+			seen[d]++
+		}
+	}
+
+	// No domain appears twice across the whole route config (Envoy's rule).
+	for d, n := range seen {
+		assert.Equalf(t, 1, n, "domain %q must appear exactly once across the route config", d)
+	}
+	// First virtual host keeps the shared domain.
+	assert.Contains(t, domainsByVH["app_onetest06_radarr"], "test.onetest06.olares.com")
+	// Second keeps its own unique domain but loses the duplicate.
+	assert.Contains(t, domainsByVH["app_onetest06_sonarr"], "sonarr.onetest06.olares.com")
+	assert.NotContains(t, domainsByVH["app_onetest06_sonarr"], "test.onetest06.olares.com")
+}
+
+// A virtual host whose every domain is already claimed (e.g. a second app with
+// an identical third_party_domain and no other domain) is dropped entirely
+// instead of poisoning the route config.
+func TestBuildMultiUserHTTPSListener_VirtualHostFullyDuplicateDropped(t *testing.T) {
+	httpIR := &ir.HTTPListenerIR{
+		Name:       "https_443_onetest06_zone",
+		Port:       443,
+		TLS:        true,
+		SNIMatches: []string{"onetest06.olares.com"},
+		TLSCert:    &ir.SecretIR{Name: "tls", CertData: "cert", KeyData: "key"},
+		UserName:   "onetest06",
+		VirtualHosts: []*ir.VirtualHostIR{
+			{
+				Name:    "custom_onetest06_appA",
+				Domains: []string{"foo.example.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r1", PathPrefix: "/"}},
+			},
+			{
+				Name:    "custom_onetest06_appB",
+				Domains: []string{"foo.example.com"},
+				Routes:  []*ir.HTTPRouteIR{{Name: "r2", PathPrefix: "/"}},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	_, routeConfigs, _ := buildMultiUserHTTPSListener(443, false, []*ir.HTTPListenerIR{httpIR}, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.Len(t, routeConfigs, 1)
+	rc := asRouteConfig(t, routeConfigs[0])
+
+	var names []string
+	for _, vh := range rc.VirtualHosts {
+		names = append(names, vh.Name)
+	}
+	assert.Contains(t, names, "custom_onetest06_appA")
+	assert.NotContains(t, names, "custom_onetest06_appB")
+}
+
+// A higher-Priority virtual host (e.g. a system service) must keep a contested
+// domain even when a lower-Priority virtual host (an app) is declared earlier,
+// so a misconfigured app cannot hijack auth/desktop/wizard.
+func TestBuildMultiUserHTTPSListener_HigherPriorityWinsDomain(t *testing.T) {
+	httpIR := &ir.HTTPListenerIR{
+		Name:       "https_443_bob_zone",
+		Port:       443,
+		TLS:        true,
+		SNIMatches: []string{"bob.snowinning.com"},
+		TLSCert:    &ir.SecretIR{Name: "tls", CertData: "cert", KeyData: "key"},
+		UserName:   "bob",
+		VirtualHosts: []*ir.VirtualHostIR{
+			{
+				// App declared first but lower priority.
+				Name:     "app_bob_desktop",
+				Priority: 0,
+				Domains:  []string{"desktop.bob.snowinning.com"},
+				Routes:   []*ir.HTTPRouteIR{{Name: "r1", PathPrefix: "/"}},
+			},
+			{
+				// System service declared later but higher priority.
+				Name:     "nonapp_desktop_bob",
+				Priority: 100,
+				Domains:  []string{"desktop.bob.snowinning.com"},
+				Routes:   []*ir.HTTPRouteIR{{Name: "r2", PathPrefix: "/"}},
+			},
+		},
+	}
+
+	clusterSet := make(map[string]bool)
+	_, routeConfigs, _ := buildMultiUserHTTPSListener(443, false, []*ir.HTTPListenerIR{httpIR}, map[string]*ir.ClusterIR{}, clusterSet)
+
+	require.Len(t, routeConfigs, 1)
+	rc := asRouteConfig(t, routeConfigs[0])
+
+	domainsByVH := map[string][]string{}
+	for _, vh := range rc.VirtualHosts {
+		domainsByVH[vh.Name] = vh.Domains
+	}
+	// System service keeps the domain; the app is dropped (no domains left).
+	assert.Equal(t, []string{"desktop.bob.snowinning.com"}, domainsByVH["nonapp_desktop_bob"])
+	assert.NotContains(t, domainsByVH, "app_bob_desktop")
+}
+
+// ---------------------------------------------------------------------------
+// parseCIDR
+// ---------------------------------------------------------------------------
+
+func TestParseCIDR(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantPrefix string
+		wantLen    uint32
+		wantErr    bool
+	}{
+		{
+			name:       "valid CIDR /24",
+			input:      "100.64.0.0/24",
+			wantPrefix: "100.64.0.0",
+			wantLen:    24,
+		},
+		{
+			name:       "valid CIDR /32",
+			input:      "192.168.1.100/32",
+			wantPrefix: "192.168.1.100",
+			wantLen:    32,
+		},
+		{
+			name:       "bare IP (no mask)",
+			input:      "10.0.0.1",
+			wantPrefix: "10.0.0.1",
+			wantLen:    32,
+		},
+		{
+			name:    "invalid",
+			input:   "not-a-cidr",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseCIDR(tt.input)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantPrefix, got.AddressPrefix)
+			assert.Equal(t, tt.wantLen, got.PrefixLen.GetValue())
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Translate (end-to-end)
+// ---------------------------------------------------------------------------
+
+func TestTranslate_AllProtocols(t *testing.T) {
+	xdsIR := &ir.Xds{
+		Listeners: []*ir.ListenerIR{
+			{
+				Name:     "http_redirect_81",
+				Address:  "0.0.0.0",
+				Port:     81,
+				Protocol: ir.ProtocolHTTP,
+				HTTPRedirect: &ir.HTTPRedirectIR{
+					Scheme: "https",
+					Code:   301,
+				},
+			},
+			{
+				Name:         "tls_443",
+				Address:      "0.0.0.0",
+				Port:         443,
+				Protocol:     ir.ProtocolTLS,
+				TLSInspector: true,
+				Routes: []*ir.RouteIR{
+					{
+						Name:       "route_alice",
+						SNIMatches: []string{"alice.example.com"},
+						Destination: &ir.DestinationIR{
+							Name: "user_alice",
+							Host: "bfl.user-space-alice",
+							Port: 444,
+						},
+						ProxyProtocolUpstream: true,
+					},
+				},
+			},
+			{
+				Name:     "stream_tcp_30000",
+				Address:  "0.0.0.0",
+				Port:     30000,
+				Protocol: ir.ProtocolTCP,
+				Routes: []*ir.RouteIR{
+					{
+						Name: "direct_30000",
+						Destination: &ir.DestinationIR{
+							Name: "direct_alice_30000",
+							Host: "bfl.user-space-alice",
+							Port: 30000,
+						},
+					},
+				},
+			},
+			{
+				Name:     "stream_udp_51820",
+				Address:  "0.0.0.0",
+				Port:     51820,
+				Protocol: ir.ProtocolUDP,
+				Routes: []*ir.RouteIR{
+					{
+						Name: "direct_51820",
+						Destination: &ir.DestinationIR{
+							Name: "direct_alice_51820",
+							Host: "bfl.user-space-alice",
+							Port: 51820,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	xt := &XdsTranslator{}
+	snap := xt.Translate(xdsIR)
+
+	// 4 listeners: HTTP redirect, TLS, TCP, UDP
+	require.Len(t, snap.Listeners, 4)
+
+	httpL := asListener(t, snap.Listeners[0])
+	assert.Equal(t, "http_redirect_81", httpL.Name)
+
+	tlsL := asListener(t, snap.Listeners[1])
+	assert.Equal(t, "tls_443", tlsL.Name)
+	require.Len(t, tlsL.FilterChains, 1)
+
+	tcpL := asListener(t, snap.Listeners[2])
+	assert.Equal(t, "stream_tcp_30000", tcpL.Name)
+
+	udpL := asListener(t, snap.Listeners[3])
+	assert.Equal(t, "stream_udp_51820", udpL.Name)
+	assert.NotNil(t, udpL.UdpListenerConfig)
+
+	// 3 distinct clusters: user_alice, direct_alice_30000, direct_alice_51820
+	require.Len(t, snap.Clusters, 3)
+}
+
+func TestTranslate_HTTPSListeners(t *testing.T) {
+	xdsIR := &ir.Xds{
+		HTTPListeners: []*ir.HTTPListenerIR{
+			{
+				Name:       "https_443_alice",
+				Address:    "0.0.0.0",
+				Port:       443,
+				TLS:        true,
+				SNIMatches: []string{"alice.example.com"},
+				TLSCert:    &ir.SecretIR{Name: "main-tls-alice", CertData: "cert", KeyData: "key"},
+				UserName:   "alice",
+				VirtualHosts: []*ir.VirtualHostIR{
+					{
+						Name:    "profile_alice",
+						Domains: []string{"alice.example.com"},
+						Routes: []*ir.HTTPRouteIR{{
+							Name:       "profile_root",
+							PathPrefix: "/",
+							Cluster:    "profile_service_alice",
+						}},
+					},
+				},
+				DefaultResponse: &ir.DirectResponseIR{Status: 421, Body: "err"},
+				PingRoute:       true,
+			},
+		},
+		Clusters: []*ir.ClusterIR{
+			{Name: "profile_service_alice", Host: "profile-service.user-space-alice.svc.cluster.local", Port: 3000, UseDNS: true},
+			{Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091, UseDNS: true},
+		},
+	}
+
+	xt := &XdsTranslator{}
+	snap := xt.Translate(xdsIR)
+
+	// 1 HTTPS listener
+	require.Len(t, snap.Listeners, 1)
+	l := asListener(t, snap.Listeners[0])
+	assert.Equal(t, "https_443", l.Name)
+	require.Len(t, l.FilterChains, 1)
+
+	hcm := hcmFromListener(t, l)
+	require.Len(t, hcm.GetEarlyHeaderMutationExtensions(), 1)
+	early := &earlyheadermutationv3.HeaderMutation{}
+	require.NoError(t, hcm.GetEarlyHeaderMutationExtensions()[0].GetTypedConfig().UnmarshalTo(early))
+	assert.Equal(t, []string{"x-bfl-user", "x-caller-appid"}, headerMutationRemoves(t, early.GetMutations()),
+		"early mutation must strip forged client identity before any HTTP filter")
+
+	require.GreaterOrEqual(t, len(hcm.GetHttpFilters()), 2)
+	assert.Equal(t, "envoy.filters.http.header_mutation", hcm.GetHttpFilters()[0].GetName(),
+		"HeaderMutation must be the first HTTP filter (before ExtAuth)")
+	stripFilter := &headermutationv3.HeaderMutation{}
+	require.NoError(t, hcm.GetHttpFilters()[0].GetTypedConfig().UnmarshalTo(stripFilter))
+	assert.Equal(t, []string{"x-bfl-user", "x-caller-appid"},
+		headerMutationRemoves(t, stripFilter.GetMutations().GetRequestMutations()))
+	assert.Equal(t, "envoy.filters.http.ext_authz", hcm.GetHttpFilters()[1].GetName(),
+		"ExtAuth must run after client identity strip")
+
+	// 1 route config
+	require.Len(t, snap.Routes, 1)
+	rc := asRouteConfig(t, snap.Routes[0])
+	assert.Equal(t, "https_443_alice_routes", rc.Name)
+	assert.Equal(t, []string{"x-caller-appid"}, rc.GetRequestHeadersToRemove(),
+		"RDS must not remove x-bfl-user (would strip Authelia session identity)")
+	assert.True(t, rc.GetMostSpecificHeaderMutationsWins())
+
+	// R1: IR no longer stamps zone-owner X-BFL-USER on outbound routes.
+	var sawBFL bool
+	for _, vh := range rc.GetVirtualHosts() {
+		for _, route := range vh.GetRoutes() {
+			if route.GetName() != "profile_root" {
+				continue
+			}
+			for _, h := range route.GetRequestHeadersToAdd() {
+				if strings.EqualFold(h.GetHeader().GetKey(), "X-BFL-USER") {
+					sawBFL = true
+				}
+			}
+		}
+	}
+	require.False(t, sawBFL, "outbound zone-owner X-BFL-USER stamp must be absent; Authelia ExtAuth supplies session identity")
+
+	// profile + authelia clusters
+	require.Len(t, snap.Clusters, 2)
+}
+
+func TestSpoofableAppIdentityHeadersToRemove(t *testing.T) {
+	got := spoofableAppIdentityHeadersToRemove()
+	require.Equal(t, []string{"x-caller-appid"}, got)
+	require.Equal(t, got, spoofableAppIdentityHeadersToRemove())
+	require.Equal(t, []string{"x-bfl-user", "x-caller-appid"}, clientSpoofableIdentityHeaders())
+}
+
+func TestAutheliaAllowedUpstreamHeadersIncludesXBFLUser(t *testing.T) {
+	var foundExact bool
+	for _, p := range autheliaAllowedUpstreamHeaders.GetPatterns() {
+		if p.GetExact() == "x-bfl-user" {
+			foundExact = true
+			break
+		}
+	}
+	require.True(t, foundExact, "ExtAuth must allow Authelia response X-BFL-USER through to upstream")
+}
+
+// applyEnvoyRequestHeaderMutations models Envoy request-header mutation order
+// for one RouteConfiguration + selected Route (VH mutations empty). Within a
+// level, remove runs before add. Across levels, MostSpecificHeaderMutationsWins
+// reverses the default most→least order (route.proto / envoy#5858).
+func applyEnvoyRequestHeaderMutations(headers map[string]string, rc *routev3.RouteConfiguration, route *routev3.Route) map[string]string {
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		out[strings.ToLower(k)] = v
+	}
+	applyLevel := func(remove []string, add []*corev3.HeaderValueOption) {
+		for _, h := range remove {
+			delete(out, strings.ToLower(h))
+		}
+		for _, opt := range add {
+			if opt.GetHeader() == nil {
+				continue
+			}
+			key := strings.ToLower(opt.GetHeader().GetKey())
+			val := opt.GetHeader().GetValue()
+			switch opt.GetAppendAction() {
+			case corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD:
+				if prev, ok := out[key]; ok {
+					out[key] = prev + "," + val
+				} else {
+					out[key] = val
+				}
+			case corev3.HeaderValueOption_ADD_IF_ABSENT:
+				if _, ok := out[key]; !ok {
+					out[key] = val
+				}
+			default: // OVERWRITE_IF_EXISTS_OR_ADD and unspecified
+				out[key] = val
+			}
+		}
+	}
+	routeRemove := route.GetRequestHeadersToRemove()
+	routeAdd := route.GetRequestHeadersToAdd()
+	rcRemove := rc.GetRequestHeadersToRemove()
+	rcAdd := rc.GetRequestHeadersToAdd()
+	if rc.GetMostSpecificHeaderMutationsWins() {
+		applyLevel(rcRemove, rcAdd)
+		applyLevel(routeRemove, routeAdd)
+	} else {
+		applyLevel(routeRemove, routeAdd)
+		applyLevel(rcRemove, rcAdd)
+	}
+	return out
+}
+
+func findNamedRoute(t *testing.T, rc *routev3.RouteConfiguration, name string) *routev3.Route {
+	t.Helper()
+	for _, vh := range rc.GetVirtualHosts() {
+		for _, route := range vh.GetRoutes() {
+			if route.GetName() == name {
+				return route
+			}
+		}
+	}
+	t.Fatalf("route %q not found", name)
+	return nil
+}
+
+// TestNorthSouthClientIdentityStripBeforeExtAuth models the R1 path:
+// early/filter strip removes forged client x-bfl-user; Authelia then sets
+// session identity; RDS must not remove x-bfl-user again.
+func TestNorthSouthClientIdentityStripBeforeExtAuth(t *testing.T) {
+	xdsIR := &ir.Xds{
+		HTTPListeners: []*ir.HTTPListenerIR{{
+			Name:       "https_443_alice",
+			Address:    "0.0.0.0",
+			Port:       443,
+			TLS:        true,
+			SNIMatches: []string{"alice.example.com"},
+			TLSCert:    &ir.SecretIR{Name: "main-tls-alice", CertData: "cert", KeyData: "key"},
+			UserName:   "alice",
+			VirtualHosts: []*ir.VirtualHostIR{{
+				Name:    "profile_alice",
+				Domains: []string{"alice.example.com"},
+				Routes: []*ir.HTTPRouteIR{{
+					Name:       "profile_root",
+					PathPrefix: "/",
+					Cluster:    "profile_service_alice",
+				}},
+			}},
+			DefaultResponse: &ir.DirectResponseIR{Status: 421, Body: "err"},
+		}},
+		Clusters: []*ir.ClusterIR{
+			{Name: "profile_service_alice", Host: "profile-service.user-space-alice.svc.cluster.local", Port: 3000, UseDNS: true},
+			{Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091, UseDNS: true},
+		},
+	}
+	snap := (&XdsTranslator{}).Translate(xdsIR)
+	hcm := hcmFromListener(t, asListener(t, snap.Listeners[0]))
+	rc := asRouteConfig(t, snap.Routes[0])
+	route := findNamedRoute(t, rc, "profile_root")
+
+	require.Equal(t, []string{"x-caller-appid"}, rc.GetRequestHeadersToRemove())
+	require.Equal(t, "envoy.filters.http.header_mutation", hcm.GetHttpFilters()[0].GetName())
+	require.Equal(t, "envoy.filters.http.ext_authz", hcm.GetHttpFilters()[1].GetName())
+
+	// Simulate: client forge present → early/filter strip → Authelia allow sets session user.
+	afterStrip := map[string]string{
+		"x-caller-appid": "spoofed-app",
+		"host":           "alice.example.com",
+	}
+	for _, h := range clientSpoofableIdentityHeaders() {
+		delete(afterStrip, h)
+	}
+	// ExtAuth AllowedUpstreamHeaders injects session identity after strip.
+	afterStrip["x-bfl-user"] = "bob"
+
+	got := applyEnvoyRequestHeaderMutations(afterStrip, rc, route)
+	assert.Equal(t, "bob", got["x-bfl-user"],
+		"Authelia session X-BFL-USER must survive RDS mutations")
+	_, hasAppid := got["x-caller-appid"]
+	assert.False(t, hasAppid, "spoofed x-caller-appid must stay removed at RDS")
+	assert.Equal(t, "alice.example.com", got["host"])
+
+	// Characterization: if x-bfl-user were still on RDS remove, session identity would be lost.
+	rcLegacy := protoCloneRouteConfig(t, rc)
+	rcLegacy.RequestHeadersToRemove = []string{"x-bfl-user", "x-caller-appid"}
+	broken := applyEnvoyRequestHeaderMutations(afterStrip, rcLegacy, route)
+	_, hasBFL := broken["x-bfl-user"]
+	assert.False(t, hasBFL,
+		"RDS remove of x-bfl-user after ExtAuth would drop Authelia session identity")
+}
+
+func protoCloneRouteConfig(t *testing.T, rc *routev3.RouteConfiguration) *routev3.RouteConfiguration {
+	t.Helper()
+	return proto.Clone(rc).(*routev3.RouteConfiguration)
+}
+
+func TestTranslate_EmptyIR(t *testing.T) {
+	xt := &XdsTranslator{}
+	snap := xt.Translate(&ir.Xds{})
+
+	assert.Empty(t, snap.Listeners)
+	assert.Empty(t, snap.Clusters)
+}
+
+// TestTranslateVirtualHost_CORSFileserverOnly pins the invariant that only
+// vhosts flagged as IsFileserver receive Envoy-level CORS response headers.
+// Regular vhosts (profile, generic apps) must be left alone so upstream CORS
+// is passed through untouched.
+func TestTranslateVirtualHost_CORSFileserverOnly(t *testing.T) {
+	hasCORSOrigin := func(vh *routev3.VirtualHost) bool {
+		for _, h := range vh.GetResponseHeadersToAdd() {
+			if h.GetHeader().GetKey() == "access-control-allow-origin" {
+				return true
+			}
+		}
+		return false
+	}
+
+	fs := translateVirtualHost(&ir.VirtualHostIR{
+		Name:         "app_alice_files_files",
+		Domains:      []string{"files.alice.example.com"},
+		IsFileserver: true,
+	}, nil)
+	assert.True(t, hasCORSOrigin(fs), "fileserver vhost must carry allow-origin")
+
+	other := translateVirtualHost(&ir.VirtualHostIR{
+		Name:    "app_alice_vault_vault-frontend",
+		Domains: []string{"vault.alice.example.com"},
+	}, nil)
+	assert.False(t, hasCORSOrigin(other), "non-fileserver vhost must not carry allow-origin")
+}
+
+func TestSubFilterLuaScript_RewritesSetCookieDomain(t *testing.T) {
+	assert.Contains(t, subFilterLuaScript, "rewrite_set_cookie_domains")
+	assert.Contains(t, subFilterLuaScript, `Domain=`)
+	assert.Contains(t, subFilterLuaScript, `headers:replace("Set-Cookie"`)
+}
+
+func TestTranslateRoute_VerifyPathSkipsServiceOverride(t *testing.T) {
+	clusterMap := map[string]*ir.ClusterIR{
+		"authelia_backend_alice": {Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091},
+	}
+	route := translateRoute(&ir.HTTPRouteIR{
+		Name:       "app",
+		PathPrefix: "/",
+		Cluster:    "app_upstream",
+		RequestHeaders: map[string]string{
+			"X-BFL-USER": "alice",
+		},
+		ExtAuth: &ir.ExtAuthConfigIR{
+			Cluster:    "authelia_backend_alice",
+			PathPrefix: "/api/verify/",
+		},
+	}, clusterMap)
+	require.NotNil(t, route.TypedPerFilterConfig)
+	anyCfg := route.TypedPerFilterConfig["envoy.filters.http.ext_authz"]
+	require.NotNil(t, anyCfg)
+
+	var perRoute extauthzv3.ExtAuthzPerRoute
+	require.NoError(t, anyCfg.UnmarshalTo(&perRoute))
+	cs := perRoute.GetCheckSettings()
+	require.NotNil(t, cs)
+	assert.Nil(t, cs.GetHttpService(), "verify path must reuse filter default HttpService without ServiceOverride")
+}
+
+func TestBuildExtAuthzFilter_DefaultVerifyPath(t *testing.T) {
+	clusterMap := map[string]*ir.ClusterIR{
+		"authelia_backend_alice": {Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091},
+	}
+	filter := buildExtAuthzFilter("authelia_backend_alice", clusterMap, "alice")
+	require.NotNil(t, filter)
+	var extAuthz extauthzv3.ExtAuthz
+	require.NoError(t, filter.GetTypedConfig().UnmarshalTo(&extAuthz))
+	hs := extAuthz.GetHttpService()
+	require.NotNil(t, hs)
+	assert.Equal(t, "/api/verify/", hs.GetPathPrefix())
+	require.NotNil(t, hs.GetAuthorizationRequest())
+	require.NotEmpty(t, hs.GetAuthorizationRequest().GetHeadersToAdd())
+}
+
+func TestTranslateRoute_NonDefaultPathKeepsFullOverride(t *testing.T) {
+	clusterMap := map[string]*ir.ClusterIR{
+		"authelia_backend_alice": {Name: "authelia_backend_alice", Host: "authelia-backend.user-system-alice.svc.cluster.local", Port: 9091},
+	}
+	route := translateRoute(&ir.HTTPRouteIR{
+		Name:       "legacy",
+		PathPrefix: "/",
+		Cluster:    "app_upstream",
+		RequestHeaders: map[string]string{
+			"X-BFL-USER": "alice",
+		},
+		ExtAuth: &ir.ExtAuthConfigIR{
+			Cluster:    "authelia_backend_alice",
+			PathPrefix: "/api/authz/ext-authz/",
+		},
+	}, clusterMap)
+	require.NotNil(t, route.TypedPerFilterConfig)
+	anyCfg := route.TypedPerFilterConfig["envoy.filters.http.ext_authz"]
+	require.NotNil(t, anyCfg)
+
+	var perRoute extauthzv3.ExtAuthzPerRoute
+	require.NoError(t, anyCfg.UnmarshalTo(&perRoute))
+	cs := perRoute.GetCheckSettings()
+	require.NotNil(t, cs)
+	hs := cs.GetHttpService()
+	require.NotNil(t, hs, "non-default Authelia path still needs a full HttpService override")
+	assert.Equal(t, "/api/authz/ext-authz/", hs.GetPathPrefix())
+	require.NotNil(t, hs.GetAuthorizationRequest())
+	headers := hs.GetAuthorizationRequest().GetHeadersToAdd()
+	require.Len(t, headers, 7)
+	assert.Equal(t, "X-BFL-USER", headers[6].GetKey())
+	assert.Equal(t, "alice", headers[6].GetValue())
+}
+
+func TestTranslateRoute_ProbeBypassHeaderMatch(t *testing.T) {
+	route := translateRoute(&ir.HTTPRouteIR{
+		Name:      "probe",
+		PathExact: "/healthz",
+		Cluster:   "app",
+		HeaderMatches: []ir.HeaderMatchIR{{
+			Name:      "user-agent",
+			SafeRegex: `^[0-9a-fA-F-]+/[0-9a-fA-F]+$`,
+		}},
+	}, nil)
+	require.NotNil(t, route.GetMatch())
+	assert.Equal(t, "/healthz", route.GetMatch().GetPath())
+	require.Len(t, route.GetMatch().GetHeaders(), 1)
+	assert.Equal(t, "user-agent", route.GetMatch().GetHeaders()[0].GetName())
+	assert.Nil(t, route.TypedPerFilterConfig, "probe bypass keeps VH-level ExtAuth disabled")
+}
+
+func TestTranslateRoute_BypassSourceCIDR(t *testing.T) {
+	route := translateRoute(&ir.HTTPRouteIR{
+		Name:      "headscale_key",
+		PathExact: "/key",
+		Cluster:   "headscale",
+		ExtAuth: &ir.ExtAuthConfigIR{
+			Cluster:    "authelia_backend_alice",
+			PathPrefix: "/api/verify/",
+		},
+		BypassSourceCIDR: true,
+	}, nil)
+
+	assert.NotNil(t, route.TypedPerFilterConfig["envoy.filters.http.ext_authz"])
+	anyCfg := route.TypedPerFilterConfig["envoy.filters.http.rbac"]
+	require.NotNil(t, anyCfg)
+	var perRoute rbacfilterv3.RBACPerRoute
+	require.NoError(t, anyCfg.UnmarshalTo(&perRoute))
+	policy := perRoute.GetRbac().GetRules().GetPolicies()["allow_all"]
+	require.NotNil(t, policy)
+	assert.True(t, policy.GetPermissions()[0].GetAny())
+	assert.True(t, policy.GetPrincipals()[0].GetAny())
+
+	route = translateRoute(&ir.HTTPRouteIR{
+		Name:      "default",
+		PathExact: "/key",
+		Cluster:   "headscale",
+		ExtAuth: &ir.ExtAuthConfigIR{
+			Cluster:    "authelia_backend_alice",
+			PathPrefix: "/api/verify/",
+		},
+	}, nil)
+	assert.NotContains(t, route.TypedPerFilterConfig, "envoy.filters.http.rbac")
+}
+
+// ---------------------------------------------------------------------------
+// suppress unused imports
+// ---------------------------------------------------------------------------
+
+var _ = []cachetypes.Resource(nil)

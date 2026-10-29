@@ -1,0 +1,113 @@
+// Package cliconfig owns the on-disk profile configuration of olares-cli
+// (~/.olares-cli/config.json). Token secrets are NOT stored here — they
+// live in the OS keychain via cli/internal/keychain.
+//
+// The package is named cliconfig (not "config") to avoid clashing with the
+// pre-existing cmd/config package, which serves a different purpose
+// (per-command flag wiring).
+package cliconfig
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/beclab/Olares/cli/internal/cachedir"
+)
+
+// homeEnv is the environment variable used to override the config dir, mirroring
+// lark-cli's $LARK_CLI_HOME convention.
+const homeEnv = "OLARES_CLI_HOME"
+
+// cacheDirEnv is set by app-service's cli-credential webhook and points at a
+// writable emptyDir mounted into an application container. It sits between
+// the explicit override and $HOME so a managed container gets a config dir it
+// can actually write to, without changing anything on a host install where
+// the variable is unset. Whether it is writable is cachedir's question to
+// answer, not ours; the name is kept here for the tests that set it.
+const cacheDirEnv = cachedir.EnvCacheDir
+
+// defaultDir is the directory name used under $HOME when $OLARES_CLI_HOME is
+// unset.
+const defaultDir = ".olares-cli"
+
+// configFilename is the only file this package owns. Token secrets used to
+// live next to it as tokens.json (Phase 1, plaintext); Phase 2 moved them
+// into the OS keychain — see cli/internal/keychain and
+// cli/pkg/auth/token_store_keychain.go.
+const configFilename = "config.json"
+
+// lockDir is the subdirectory of Home() holding every advisory lock the CLI
+// takes: this package's config.lock plus the per-olaresId token-refresh
+// locks built by pkg/credential.
+const lockDir = "locks"
+
+// configLockFilename serializes read-modify-write cycles on config.json.
+// See MutateProfile.
+const configLockFilename = "config.lock"
+
+// Permissions for the config dir & file. config.json holds the profile index
+// (no secrets) but we still keep it 0600 because it does carry the
+// `currentProfile` selection and any auth-URL overrides.
+const (
+	dirPerm  os.FileMode = 0o700
+	filePerm os.FileMode = 0o600
+)
+
+// Home returns the resolved olares-cli config directory: $OLARES_CLI_HOME,
+// then the platform cache base's `config`, then $HOME/.olares-cli. The
+// directory is NOT created here — callers that intend to write should call
+// EnsureHome instead.
+//
+// The middle rung goes through cachedir, which substitutes a writable
+// directory when the one the platform exported cannot be written to. Reads
+// resolve through the same call, so config.json is looked for where the last
+// write actually landed.
+func Home() (string, error) {
+	if v := os.Getenv(homeEnv); v != "" {
+		return v, nil
+	}
+	if base, ok := cachedir.Base(); ok {
+		return filepath.Join(base, "config"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home: %w", err)
+	}
+	return filepath.Join(home, defaultDir), nil
+}
+
+// EnsureHome resolves Home() and ensures the directory exists with 0700 perms.
+func EnsureHome() (string, error) {
+	dir, err := Home()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return "", fmt.Errorf("create %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// ConfigFile returns the absolute path to config.json (without creating it).
+func ConfigFile() (string, error) {
+	dir, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, configFilename), nil
+}
+
+// LockPath returns the absolute path of the named lock file under
+// Home()/locks/. Neither the directory nor the file is created here —
+// lockfile.Acquire does that when it takes the lock.
+//
+// Callers naming a lock after user input must run it through
+// lockfile.Sanitize first; this function does not validate `name`.
+func LockPath(name string) (string, error) {
+	dir, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, lockDir, name), nil
+}

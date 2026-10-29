@@ -1,0 +1,261 @@
+
+
+name: Daily Build Release
+
+on:
+  schedule:
+    # This is a UTC time
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+jobs:
+
+  daily-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.generate.outputs.version }}
+    steps:
+      - id: generate
+        run: |
+          v=1.12.8-$(date +"%Y%m%d")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  release-id:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.generate.outputs.id }}
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+      - id: generate
+        run: |
+          hash=$(git rev-parse --short=7 HEAD)
+          echo "id=$hash" >> "$GITHUB_OUTPUT"
+
+  release-cli:
+    needs: [daily-version, release-id]
+    uses: ./.github/workflows/release-cli.yaml
+    secrets: inherit
+    with:
+      version: ${{ needs.daily-version.outputs.version }}
+      release-id: ${{ needs.release-id.outputs.id }}
+
+  release-daemon:
+    needs: [daily-version, release-id]
+    uses: ./.github/workflows/release-daemon.yaml
+    secrets: inherit
+    with:
+      version: ${{ needs.daily-version.outputs.version }}
+      release-id: ${{ needs.release-id.outputs.id }}
+
+  push-images:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      - run: |
+          bash build/image-manifest.sh && bash build/upload-images.sh .manifest/images.mf
+
+  push-images-arm64:
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      - run: |
+          export PATH=$PATH:/usr/local/bin:/home/ubuntu/.local/bin
+          bash build/image-manifest.sh && bash build/upload-images.sh .manifest/images.mf linux/arm64
+
+  push-deps:
+    needs: [daily-version, release-id, release-daemon]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      # test
+      - env:
+          VERSION: ${{ needs.daily-version.outputs.version }}
+          RELEASE_ID: ${{ needs.release-id.outputs.id }}
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          bash build/deps-manifest.sh && bash build/upload-deps.sh
+
+  push-deps-arm64:
+    needs: [daily-version, release-id, release-daemon]
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      # test
+      - env:
+          VERSION: ${{ needs.daily-version.outputs.version }}
+          RELEASE_ID: ${{ needs.release-id.outputs.id }}
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          export PATH=$PATH:/usr/local/bin:/home/ubuntu/.local/bin
+          bash build/deps-manifest.sh linux/arm64 && bash build/upload-deps.sh linux/arm64
+
+
+  upload-package:
+    needs: [daily-version, release-id, push-images, push-images-arm64, push-deps, push-deps-arm64]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+
+      - name: Package installer
+        run: |
+          bash build/build.sh ${{ needs.daily-version.outputs.version }} ${{ needs.release-id.outputs.id }}
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      - name: Upload to COS
+        id: upload
+        run: |
+          md5sum install-wizard-v${{ needs.daily-version.outputs.version }}.tar.gz > install-wizard-v${{ needs.daily-version.outputs.version }}.md5sum.txt && \
+          coscmd upload install-wizard-v${{ needs.daily-version.outputs.version }}.md5sum.txt ${{ secrets.REPO_PATH }}install-wizard-v${{ needs.daily-version.outputs.version }}.md5sum.txt && \
+          coscmd upload install-wizard-v${{ needs.daily-version.outputs.version }}.tar.gz ${{ secrets.REPO_PATH }}install-wizard-v${{ needs.daily-version.outputs.version }}.tar.gz && \
+
+          coscmd upload install-wizard-v${{ needs.daily-version.outputs.version }}.md5sum.txt ${{ secrets.REPO_PATH }}install-wizard-v${{ needs.daily-version.outputs.version }}.${{ needs.release-id.outputs.id }}.md5sum.txt && \
+          coscmd upload install-wizard-v${{ needs.daily-version.outputs.version }}.tar.gz ${{ secrets.REPO_PATH }}install-wizard-v${{ needs.daily-version.outputs.version }}.${{ needs.release-id.outputs.id }}.tar.gz 
+
+      - name: Upload join script to COS
+        run: |
+          coscmd upload .dist/install-wizard/joincluster.sh /joincluster-v${{ needs.daily-version.outputs.version }}.sh
+
+
+  release:
+    needs: [daily-version, upload-package, release-cli, release-id]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+
+      - name: Package installer
+        run: |
+          bash build/build.sh ${{ needs.daily-version.outputs.version }} ${{ needs.release-id.outputs.id }}
+
+      - name: Download CLI release assets
+        env:
+          VERSION: ${{ needs.daily-version.outputs.version }}
+          RELEASE_ID: ${{ needs.release-id.outputs.id }}
+          REPO_PATH: ${{ secrets.REPO_PATH }}
+        run: |
+          mkdir -p cli-output
+          for target in linux_amd64 linux_arm linux_arm64 darwin_arm64 windows_amd64; do
+            file="olares-cli-v${VERSION}_${target}.${RELEASE_ID}.tar.gz"
+            curl -sSfL -o "cli-output/${file}" "https://cdn.olares.com${REPO_PATH}${file}"
+          done
+
+      - name: 'Archives'
+        run: |
+          cp .dist/install-wizard/install.sh build/base-package
+          cp build/base-package/install.sh build/base-package/publicInstaller.sh
+          cp .dist/install-wizard/install.ps1 build/base-package
+          cp .dist/install-wizard/joincluster.sh build/base-package
+
+      - name: Release public files
+        uses: softprops/action-gh-release@v1
+        with:
+          name: v${{ needs.daily-version.outputs.version }} Release
+          tag_name: ${{ needs.daily-version.outputs.version }}
+          files: |
+            install-wizard-v${{ needs.daily-version.outputs.version }}.tar.gz
+            build/base-package/publicInstaller.sh
+            build/base-package/install.sh
+            build/base-package/install.ps1
+            build/base-package/joincluster.sh
+            build/base-package/publicAddnode.sh
+            build/base-package/version.hint
+            build/base-package/publicRestoreInstaller.sh
+            cli-output/*.tar.gz
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

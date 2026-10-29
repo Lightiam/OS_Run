@@ -1,0 +1,12 @@
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Build and dependency output, should any land here
+node_modules/
+__pycache__/
+*.pyc
+
+# Never commit a collector key or an env file holding one
+*.env
+collector.env

@@ -1,0 +1,480 @@
+
+{{- $namespace := printf "%s" "os-framework" -}}
+{{- $search3_secret := (lookup "v1" "Secret" $namespace "search3-secrets") -}}
+{{- $pg_password := "" -}}
+{{ if $search3_secret -}}
+{{ $pg_password = (index $search3_secret "data" "pg_password") }}
+{{ else -}}
+{{ $pg_password = randAlphaNum 16 | b64enc }}
+{{- end -}}
+
+{{- $search_server_nats_secret := (lookup "v1" "Secret" $namespace "search-server-nats-secret") -}}
+{{- $nats_password := "" -}}
+{{ if $search_server_nats_secret -}}
+{{ $nats_password = (index $search_server_nats_secret "data" "nats_password") }}
+{{ else -}}
+{{ $nats_password = randAlphaNum 16 | b64enc }}
+{{- end -}}
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: search-server-nats-secret
+  namespace: {{ .Release.Namespace }}
+type: Opaque
+data:
+  nats_password: {{ $nats_password }}
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: search3-secrets
+  namespace: {{ .Release.Namespace }}
+type: Opaque
+data:
+  pg_password: {{ $pg_password }}
+
+---
+apiVersion: apr.bytetrade.io/v1alpha1
+kind: MiddlewareRequest
+metadata:
+  name: search3-pg
+  namespace: {{ .Release.Namespace }}
+spec:
+  app: search3
+  appNamespace: {{ .Release.Namespace }}
+  middleware: postgres
+  postgreSQL:
+    user: search3_os_framework
+    password:
+      valueFrom:
+        secretKeyRef:
+          key: pg_password
+          name: search3-secrets
+    databases:
+      - name: search3
+        extensions:
+        - pg_trgm
+        - btree_gin
+        - zhparser
+        - vector
+        scripts:
+        - begin;
+        - CREATE TEXT SEARCH CONFIGURATION chinese (PARSER = zhparser);
+        - ALTER TEXT SEARCH CONFIGURATION chinese ADD MAPPING FOR a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION arabic DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION arabic DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION arabic ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION arabic ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION armenian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION armenian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION armenian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION armenian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION basque DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION basque DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION basque ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION basque ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION catalan DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION catalan DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION catalan ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION catalan ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION danish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION danish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION danish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION danish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION dutch DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION dutch DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION dutch ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION dutch ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION english ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION english ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION finnish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION finnish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION finnish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION finnish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION french DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION french DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION french ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION french ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION german DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION german DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION german ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION german ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION greek DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION greek DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION greek ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION greek ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION hindi DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION hindi DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION hindi ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION hindi ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION hungarian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION hungarian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION hungarian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION hungarian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION indonesian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION indonesian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION indonesian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION indonesian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION irish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION irish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION irish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION irish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION italian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION italian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION italian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION italian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION lithuanian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION lithuanian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION lithuanian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION lithuanian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION nepali DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION nepali DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION nepali ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION nepali ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION norwegian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION norwegian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION norwegian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION norwegian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION portuguese DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION portuguese DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION portuguese ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION portuguese ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION romanian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION romanian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION romanian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION romanian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION russian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION russian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION russian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION russian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION serbian DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION serbian DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION serbian ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION serbian ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION spanish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION spanish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION spanish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION spanish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION swedish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION swedish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION swedish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION swedish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION tamil DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION tamil DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION tamil ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION tamil ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION turkish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION turkish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION turkish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION turkish ADD MAPPING FOR asciiword WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION yiddish DROP MAPPING FOR word;
+        - ALTER TEXT SEARCH CONFIGURATION yiddish DROP MAPPING FOR asciiword;
+        - ALTER TEXT SEARCH CONFIGURATION yiddish ADD MAPPING FOR word WITH simple;
+        - ALTER TEXT SEARCH CONFIGURATION yiddish ADD MAPPING FOR asciiword WITH simple;
+        - commit;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search3
+  namespace: {{ .Release.Namespace }}
+  labels:
+    applications.app.bytetrade.io/author: bytetrade.io
+  annotations:
+    applications.app.bytetrade.io/version: '0.0.1'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: search3
+  template:
+    metadata:
+      labels:
+        app: search3
+    spec:
+      serviceAccountName: os-internal
+      priorityClassName: "system-cluster-critical"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      volumes:
+        - name: userspace-dir
+          hostPath:
+            path: /olares/rootfs/userspace
+            type: Directory
+        - name: fb-data
+          hostPath:
+            path: /olares/userdata/Cache/files
+            type: DirectoryOrCreate
+        - name: upload-appdata
+          hostPath:
+            path: /olares/userdata/Cache
+            type: DirectoryOrCreate
+        - name: user-appdata-dir
+          hostPath:
+            path: /olares/userdata/Cache
+            type: Directory
+        - name: shared-lib
+          hostPath:
+            path: /olares/share
+            type: Directory
+        - name: common-data
+          hostPath:
+            path: /olares/rootfs/Common
+            type: DirectoryOrCreate
+      initContainers:
+      - name: init-container
+        image: 'postgres:16.0-alpine3.18'
+        command:
+          - sh
+          - '-c'
+          - >-
+            echo -e "Checking for the availability of PostgreSQL Server deployment"; until psql -h $PGHOST -p $PGPORT -U $PGUSER -d $PGDB1 -c "SELECT 1"; do sleep 1; printf "-"; done; sleep 5; echo -e " >> PostgreSQL DB Server has started";
+        env:
+          - name: PGHOST
+            value: citus-0.citus-headless.os-platform.svc.cluster.local
+          - name: PGPORT
+            value: "5432"
+          - name: PGUSER
+            value: search3_os_framework
+          - name: PGPASSWORD
+            value: {{ $pg_password | b64dec }}
+          - name: PGDB1
+            value: os_framework_search3
+      containers:
+      - name: search3
+        image: beclab/search3:v0.4.5
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: TERMINUSD_HOST
+          value: master-node:18088  
+        - name: DATABASE_URL
+          value: postgres://search3_os_framework:{{ $pg_password | b64dec }}@citus-0.citus-headless.os-platform:5432/os_framework_search3
+        - name: NATS_HOST
+          value: nats.os-platform
+        - name: NATS_PORT
+          value: "4222"
+        - name: NATS_USERNAME
+          value: os-search-server
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: nats_password
+              name: search-server-nats-secret
+        - name: NATS_SUBJECT_SYSTEM_SEARCH
+          value: os.search
+        - name: NATS_SUBJECT_SYSTEM_USERS
+          value: os.users
+        - name: NATS_SUBJECT_SYSTEM_GROUPS
+          value: os.groups
+        - name: NATS_SEARCH_ENABLED
+          value: "true"
+        - name: NATS_SEARCH_CACHE_HITS
+          value: "true"
+        - name: JINA_CLIP_V2_URL
+          value: http://sharedentrances-api.jinaclipv2embed-shared
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: search3monitor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: search3monitor
+spec:
+  selector:
+    matchLabels:
+      app: search3monitor
+  template:
+    metadata:
+      labels:
+        app: search3monitor
+    spec:
+      serviceAccountName: os-internal
+      priorityClassName: "system-cluster-critical"
+      containers:
+      - name: search3monitor
+        image: beclab/search3monitor:v0.4.6
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8081
+        env:
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: TERMINUSD_HOST
+          value: master-node:18088  
+        - name: DATABASE_URL
+          value: postgres://search3_os_framework:{{ $pg_password | b64dec }}@citus-0.citus-headless.os-platform:5432/os_framework_search3
+        - name: SEARCH3_SERVER_ADDRESS
+          value: search3.os-framework:80
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: LOG_FILE
+          value: "true"
+        - name: NATS_HOST
+          value: nats.os-platform
+        - name: NATS_PORT
+          value: "4222"
+        - name: NATS_USERNAME
+          value: os-search-server
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: nats_password
+              name: search-server-nats-secret
+        - name: NATS_SUBJECT_SYSTEM_SEARCH
+          value: os.search
+        - name: NATS_SUBJECT_SYSTEM_USERS
+          value: os.users
+        - name: NATS_SUBJECT_SYSTEM_GROUPS
+          value: os.groups
+        - name: LOG_MAX_FILE_BYTES
+          value: "16777216"
+        - name: LOG_DIR_MAX_BYTES
+          value: "1073741824"
+        - name: JINA_CLIP_V2_URL
+          value: http://sharedentrances-api.jinaclipv2embed-shared
+        volumeMounts:
+          - name: fb-data
+            mountPath: /appdata
+          - name: userspace-dir
+            mountPath: /data
+          - name: upload-appdata
+            mountPath: /appcache/
+          - name: shared-lib
+            mountPath: /data/External
+            mountPropagation: Bidirectional
+          - name: common-data
+            mountPath: /appcommon/
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          allowPrivilegeEscalation: true
+      volumes:
+        - name: userspace-dir
+          hostPath:
+            path: /olares/rootfs/userspace
+            type: Directory
+        - name: fb-data
+          hostPath:
+            path: /olares/userdata/Cache/files
+            type: DirectoryOrCreate
+        - name: upload-appdata
+          hostPath:
+            path: /olares/userdata/Cache
+            type: DirectoryOrCreate
+        - name: shared-lib
+          hostPath:
+            path: /olares/share
+            type: Directory
+        - name: common-data
+          hostPath:
+            path: /olares/rootfs/Common
+            type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search3
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    app: search3
+  type: ClusterIP
+  ports:
+    - protocol: TCP
+      name: search3
+      port: 80
+      targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search3monitor-headless
+  namespace: {{ .Release.Namespace }}
+spec:
+  clusterIP: None
+  selector:
+    app: search3monitor
+  ports:
+  - port: 8081
+    targetPort: 8081
+
+---
+apiVersion: apr.bytetrade.io/v1alpha1
+kind: MiddlewareRequest
+metadata:
+  name: search-server-nats
+  namespace: {{ .Release.Namespace }}
+spec:
+  app: search-server
+  appNamespace: os
+  middleware: nats
+  nats:
+    password:
+      valueFrom:
+        secretKeyRef:
+          key: nats_password
+          name: search-server-nats-secret
+    subjects:
+      # os.search.* — one token after search (e.g. os.search.<user>)
+      - name: "search.*"
+        permission:
+          pub: allow
+          sub: allow
+      # os.search.> — multi-level under search (e.g. os.search.<user>.<reqid> for federated search)
+      - name: "search.>"
+        permission:
+          pub: allow
+          sub: allow
+      # exact os.search
+      - name: search
+        permission:
+          pub: allow
+          sub: allow
+      - name: users
+        permission:
+          pub: allow
+          sub: allow
+      - name: groups
+        permission:
+          pub: allow
+          sub: allow
+    user: os-search-server

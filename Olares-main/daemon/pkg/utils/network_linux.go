@@ -1,0 +1,566 @@
+//go:build linux
+// +build linux
+
+package utils
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/beclab/Olares/daemon/internel/wifi"
+	"github.com/vishvananda/netlink"
+	"k8s.io/klog/v2"
+)
+
+func ConnectWifi(ctx context.Context, ssid, password string) error {
+	return wifi.Connect(ctx, wifi.ConnectRequest{SSID: ssid, Password: password})
+}
+
+func EnableWifi(ctx context.Context) error {
+	nmcli, err := findCommand(ctx, "nmcli")
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, nmcli, "r", "wifi", "on")
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	klog.Info(string(output))
+
+	if err != nil {
+		klog.Error("exec cmd error, ", err, ", nmcli r wifi on")
+		return err
+	}
+
+	return nil
+}
+
+func GetWifiDevice(ctx context.Context) (map[string]Device, error) {
+	return deviceStatus(ctx, func(d *Device) bool { return d.Type == "wifi" }, true)
+}
+
+// managedByOthers reports whether the device is managed by another component
+// (CNI, tunnels, tailscale, ...) and should be skipped by NetworkManager logic.
+func managedByOthers(name string) bool {
+	for _, devPrefix := range []string{"cali", "kube", "tun", "tailscale"} {
+		if strings.HasPrefix(name, devPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func GetAllDevice(ctx context.Context) (map[string]Device, error) {
+	return deviceStatus(ctx, func(d *Device) bool {
+		return !managedByOthers(d.Name)
+	}, true)
+}
+
+// setDeviceManaged switches a single device to managed via nmcli.
+func setDeviceManaged(ctx context.Context, name string) error {
+	nmcli, err := findCommand(ctx, "nmcli")
+	if err != nil {
+		klog.Error("find nmcli error, ", err)
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, nmcli, "device", "set", name, "managed", "yes")
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Error("exec cmd error, ", err, ", nmcli device set ", name, " managed yes")
+		return err
+	}
+	if strings.Contains(string(output), "Error") {
+		err = errors.New(string(output))
+		klog.Error("exec cmd error, ", err, ", nmcli device set ", name, " managed yes")
+		return err
+	}
+	return nil
+}
+
+func ManagedAllDevices(ctx context.Context) (map[string]Device, error) {
+	return deviceStatus(ctx, func(d *Device) bool {
+		if managedByOthers(d.Name) {
+			return false
+		}
+		if d.State == "unmanaged" {
+			if err := setDeviceManaged(ctx, d.Name); err != nil {
+				return false
+			}
+		}
+		return true
+	}, true)
+}
+
+// ManagedDeviceStatus enumerates network devices with a single
+// `nmcli device status` call and, in the same pass, switches any unmanaged
+// device to managed. It deliberately skips the per-device `nmcli device show`
+// / `nmcli connection show` fan-out (i.e. it does not populate IP/gateway/DNS/
+// method fields), because the frequent state-polling path only needs
+// Name/Type/State/Connection. This replaces the previous back-to-back
+// ManagedAllDevices + GetAllDevice calls, which together spawned ~(4 + 8M)
+// bash/nmcli processes per poll (M = device count) and kept NetworkManager
+// busy.
+func ManagedDeviceStatus(ctx context.Context) (map[string]Device, error) {
+	return deviceStatus(ctx, func(d *Device) bool {
+		if managedByOthers(d.Name) {
+			return false
+		}
+		if d.State == "unmanaged" {
+			if err := setDeviceManaged(ctx, d.Name); err != nil {
+				return false
+			}
+		}
+		return true
+	}, false)
+}
+
+func deviceStatus(ctx context.Context, filter func(d *Device) bool, details bool) (map[string]Device, error) {
+	nmcli, err := findCommand(ctx, "nmcli")
+	if err != nil {
+		return nil, err
+	}
+
+	fields := []string{"DEVICE", "TYPE", "STATE", "CONNECTION"}
+
+	cmdArgs := []string{"-g", strings.Join(fields, ",")}
+	cmdArgs = append(cmdArgs, "device", "status")
+
+	cmd := exec.CommandContext(ctx, nmcli, cmdArgs...)
+	cmd.Env = os.Environ()
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute nmcli with args %+q: %w", cmdArgs, err)
+	}
+
+	parsedOutput, err := parseCmdOutput(output, len(fields))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse nmcli output: %w", err)
+	}
+
+	statuss := make(map[string]Device)
+	for _, fields := range parsedOutput {
+		d := Device{
+			Name:       fields[0],
+			Type:       fields[1],
+			State:      fields[2],
+			Connection: fields[3],
+		}
+
+		if filter == nil || filter(&d) {
+			if details {
+				err = showDeviceByNM(ctx, d.Name, &d)
+				if err != nil {
+					klog.Error("failed to get device details for ", d.Name, ": ", err)
+					continue
+				}
+			}
+
+			statuss[d.Name] = d
+		}
+	}
+
+	return statuss, nil
+}
+
+func parseCmdOutput(output []byte, expectedCountOfFields int) ([][]string, error) {
+	lines := bytes.FieldsFunc(output, func(c rune) bool { return c == '\n' || c == '\r' })
+
+	var recordLines [][]string
+	for i, line := range lines {
+		recordLine := splitBySeparator(":", string(line))
+		if len(recordLine) != expectedCountOfFields {
+			return nil, fmt.Errorf(
+				"line %d contains %d fields but should %d",
+				i, len(recordLine), expectedCountOfFields,
+			)
+		}
+
+		recordLines = append(recordLines, recordLine)
+	}
+
+	return recordLines, nil
+}
+
+func splitBySeparator(separator, line string) []string {
+	escape := `\`
+	tempEscapedSeparator := "\x00"
+
+	replacedEscape := strings.ReplaceAll(line, escape+separator, tempEscapedSeparator)
+	records := strings.Split(replacedEscape, separator)
+
+	for i, record := range records {
+		records[i] = strings.ReplaceAll(record, tempEscapedSeparator, separator)
+	}
+
+	return records
+}
+
+// command: nmcli device show <interface>
+// output format:
+// GENERAL.DEVICE:                         enp3s0
+// GENERAL.TYPE:                           ethernet
+// GENERAL.HWADDR:                         34:5A:60:35:69:CC
+// GENERAL.MTU:                            1500
+// GENERAL.STATE:                          100 (connected)
+// GENERAL.CONNECTION:                     Wired connection 1
+// GENERAL.CON-PATH:                       /org/freedesktop/NetworkManager/ActiveConnection/1
+// WIRED-PROPERTIES.CARRIER:               on
+// IP4.ADDRESS[1]:                         192.168.31.145/24
+// IP4.GATEWAY:                            192.168.31.1
+// IP4.ROUTE[1]:                           dst = 169.254.0.0/16, nh = 0.0.0.0, mt = 1000
+// IP4.ROUTE[2]:                           dst = 192.168.31.0/24, nh = 0.0.0.0, mt = 100
+// IP4.ROUTE[3]:                           dst = 0.0.0.0/0, nh = 192.168.31.1, mt = 100
+// IP4.DNS[1]:                             192.168.31.1
+// IP6.ADDRESS[1]:                         2408:8606:1800:1::d4a/128
+// IP6.ADDRESS[2]:                         2408:8606:1800:1:16c5:3fa5:ad66:f6d9/64
+// IP6.ADDRESS[3]:                         2408:8606:1800:1:16f4:a31b:b33f:26f2/64
+// IP6.ADDRESS[4]:                         fe80::7272:12f8:6ef6:2a42/64
+// IP6.GATEWAY:                            fe80::5aea:1fff:fe64:b5dc
+// IP6.ROUTE[1]:                           dst = fe80::/64, nh = ::, mt = 1024
+// IP6.ROUTE[2]:                           dst = 2408:8606:1800:1::/64, nh = ::, mt = 100
+// IP6.ROUTE[3]:                           dst = ::/0, nh = fe80::5aea:1fff:fe64:b5dc, mt = 20100
+// IP6.ROUTE[4]:                           dst = 2408:8606:1800:1::d4a/128, nh = ::, mt = 100
+// IP6.DNS[1]:                             fe80::5aea:1fff:fe64:b5dc
+func showDeviceByNM(ctx context.Context, deviceName string, device *Device) error {
+	nmcli, err := findCommand(ctx, "nmcli")
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, nmcli, "device", "show", deviceName)
+	cmd.Env = os.Environ()
+
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to execute nmcli: %w", err)
+	}
+
+	lines := bytes.Split(output, []byte("\n"))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		fields := bytes.SplitN(line, []byte(":"), 2)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(string(fields[0]))
+		value := strings.TrimSpace(string(fields[1]))
+
+		switch key {
+		case "IP4.ADDRESS[1]":
+			ipAndMask := strings.Split(value, "/")
+			if len(ipAndMask) > 1 {
+				device.Ipv4Address = ipAndMask[0]
+				cidr, err := strconv.Atoi(ipAndMask[1])
+				if err != nil {
+					klog.Error("convert cidr error, ", err)
+					continue
+				}
+				mask, err := MaskFromCIDR(cidr)
+				if err != nil {
+					klog.Error("get mask from cidr error, ", err)
+					continue
+				}
+				device.Ipv4Mask = mask
+			}
+		case "IP4.GATEWAY":
+			device.Ipv4Gateway = value
+		case "IP4.DNS[1]":
+			device.Ipv4DNS = value
+		case "IP6.ADDRESS[1]":
+			device.Ipv6Address = value
+		case "IP6.GATEWAY":
+			device.Ipv6Gateway = value
+		case "IP6.DNS[1]":
+			device.Ipv6DNS = value
+		case "GENERAL.CONNECTION":
+			err := showConnectionByNM(ctx, value, device)
+			if err != nil {
+				klog.V(8).Info("get connection method error, ", err, ", connection name: ", value)
+			}
+		default:
+			continue
+		}
+	}
+
+	return nil
+}
+
+// nmcli connection show "Wired connection 1"
+func showConnectionByNM(ctx context.Context, connectionName string, device *Device) error {
+	nmcli, err := findCommand(ctx, "nmcli")
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, nmcli, "connection", "show", connectionName)
+	cmd.Env = os.Environ()
+
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to execute nmcli: %w", err)
+	}
+
+	lines := bytes.Split(output, []byte("\n"))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		fields := bytes.SplitN(line, []byte(":"), 2)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(string(fields[0]))
+		value := strings.TrimSpace(string(fields[1]))
+
+		switch key {
+		case "ipv4.method":
+			device.Method = value
+		}
+	}
+	return nil
+}
+
+type NetworkTraffic struct {
+	Interface string
+	RxBytes   uint64
+	TxBytes   uint64
+}
+
+func getInterfaceTraffic() (traffic map[string]*NetworkTraffic, err error) {
+	file, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	traffic = make(map[string]*NetworkTraffic)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		fields := strings.Fields(parts[1])
+		if len(fields) < 9 {
+			return nil, fmt.Errorf("unexpected format for interface %s", parts[0])
+		}
+		rxBytes, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		txBytes, err := strconv.ParseUint(fields[8], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+
+		traffic[parts[0]] = &NetworkTraffic{
+			Interface: parts[0],
+			RxBytes:   rxBytes,
+			TxBytes:   txBytes,
+		}
+	}
+
+	return traffic, nil
+}
+
+type NetworkTrafficRate struct {
+	Interface  string
+	RxBytes    uint64
+	TxBytes    uint64
+	RxRate     float64
+	TxRate     float64
+	UpdateTime time.Time
+}
+
+var AllNetworkDeviceTraffic = make(map[string]*NetworkTrafficRate)
+
+func UpdateNetworkTraffic(ctx context.Context) {
+	traffic, err := getInterfaceTraffic()
+	if err != nil {
+		klog.Error("get interface traffic error, ", err)
+		return
+	}
+
+	for name, netTraffic := range traffic {
+		rate, ok := AllNetworkDeviceTraffic[name]
+		if !ok {
+			AllNetworkDeviceTraffic[name] = &NetworkTrafficRate{
+				Interface:  name,
+				RxBytes:    netTraffic.RxBytes,
+				TxBytes:    netTraffic.TxBytes,
+				UpdateTime: time.Now(),
+			}
+			continue
+		}
+
+		rate.RxRate = float64(netTraffic.RxBytes-rate.RxBytes) / time.Since(rate.UpdateTime).Seconds()
+		rate.TxRate = float64(netTraffic.TxBytes-rate.TxBytes) / time.Since(rate.UpdateTime).Seconds()
+		rate.RxBytes = netTraffic.RxBytes
+		rate.TxBytes = netTraffic.TxBytes
+		rate.UpdateTime = time.Now()
+	}
+}
+
+func GetInterfaceTraffic(iface string) (rxBytes, txBytes float64, err error) {
+	rates, ok := AllNetworkDeviceTraffic[iface]
+	if !ok {
+		return 0, 0, fmt.Errorf("interface %s not found", iface)
+	}
+	return rates.RxRate, rates.TxRate, nil
+}
+
+// get ethernet connection
+func GetEthernetConnection(ctx context.Context) (iface, ifUUID, connection string, err error) {
+	var (
+		iefs []net.Interface
+	)
+	if iefs, err = net.Interfaces(); err != nil {
+		klog.Error("list network interfaces error, ", err)
+		return "", "", "", err
+	}
+
+	// get k8s master node ip
+	masterIp, err := MasterNodeIp(true)
+	if err != nil {
+		klog.Error("get master node ip error, ", err)
+		// FIXME: if k8s is not installed or not ready, we should return error
+	}
+
+	var firstEthernetInterface struct {
+		Name       string
+		UUID       string
+		Connection string
+	}
+	for _, ief := range iefs {
+		if ief.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		nmcli, err := findCommand(ctx, "nmcli")
+		if err != nil {
+			klog.Error("find nmcli command error, ", err)
+			return "", "", "", err
+		}
+		cmd := exec.CommandContext(ctx, nmcli, "-g", "GENERAL.TYPE,IP4.ADDRESS,GENERAL.CON-UUID,GENERAL.CONNECTION", "device", "show", ief.Name)
+		cmd.Env = os.Environ()
+		output, err := cmd.Output()
+		if err != nil {
+			klog.Error("failed to execute nmcli: %w", err)
+			return "", "", "", err
+		}
+
+		lines := bytes.Split(output, []byte("\n"))
+		if len(lines) < 4 {
+			klog.Errorf("unexpected output from nmcli: %s", string(output))
+			return "", "", "", errors.New(fmt.Sprintf("unexpected output from nmcli: %s", string(output)))
+		}
+
+		ifType := strings.TrimSpace(string(lines[0]))
+		ipv4 := strings.TrimSpace(string(lines[1])) // got 192.168.31.145/24
+		ipv4 = strings.Split(ipv4, "/")[0]
+		ifUUID := strings.TrimSpace(string(lines[2]))
+		connection := strings.TrimSpace(string(lines[3]))
+		if ipv4 == "" {
+			continue
+		}
+
+		if connection == bridgeConnectionName ||
+			strings.HasPrefix(connection, bridgeSlavePrefix) {
+			// bridge connection
+			continue
+		}
+
+		// active connection
+		switch ifType {
+		case "ethernet":
+			if masterIp != "" && masterIp == ipv4 {
+				// use the ethernet interface of the master node binding in priority
+				return ief.Name, ifUUID, connection, nil
+			}
+			if firstEthernetInterface.Name == "" {
+				firstEthernetInterface.Name = ief.Name
+				firstEthernetInterface.UUID = ifUUID
+				firstEthernetInterface.Connection = connection
+			}
+		default:
+			continue
+		}
+	}
+
+	if firstEthernetInterface.Name != "" {
+		return firstEthernetInterface.Name, firstEthernetInterface.UUID, firstEthernetInterface.Connection, nil
+	}
+
+	klog.Error("no ethernet connection found")
+	return "", "", "", errors.New("no ethernet connection found")
+}
+
+const (
+	bridgeConnectionName = "br-olares"
+	bridgeSlavePrefix    = "br-olares-slave-"
+)
+
+// ListenNetworkCarrierChanges runs downCallback whenever the named device loses
+// carrier or is set down. The device is the current overlay parent, resolved by
+// the caller through the alternative name.
+func ListenNetworkCarrierChanges(ctx context.Context, device string, downCallback func()) error {
+	updates := make(chan netlink.LinkUpdate)
+
+	if err := netlink.LinkSubscribe(updates, ctx.Done()); err != nil {
+		klog.Error("subscribe network changes error, ", err)
+		return err
+	}
+
+	for {
+		select {
+		case update, ok := <-updates:
+			if handleCarrierLinkUpdate(ctx, device, update, ok, downCallback) {
+				klog.Info("stop listening network changes")
+				return nil
+			}
+		case <-ctx.Done():
+			klog.Info("stop listening network changes")
+			return nil
+		}
+	}
+}
+
+// handleCarrierLinkUpdate processes one LinkUpdate. Returns true when the
+// watcher should stop (channel closed or context cancelled). A closed channel
+// yields a zero-value LinkUpdate whose Link is nil; callers must not call
+// Attrs() on it.
+func handleCarrierLinkUpdate(ctx context.Context, device string, update netlink.LinkUpdate, ok bool, downCallback func()) (stop bool) {
+	if !ok || ctx.Err() != nil {
+		return true
+	}
+	if update.Link == nil {
+		return false
+	}
+	attrs := update.Attrs()
+	if attrs == nil || attrs.Name != device {
+		return false
+	}
+
+	isLowerUp := (update.Flags & 0x10000) != 0
+	isUp := (update.Flags & 1) != 0
+	if !isLowerUp || !isUp {
+		klog.Infof("network change detected: %s, state: %s", attrs.Name, attrs.OperState.String())
+		downCallback()
+	}
+	return false
+}

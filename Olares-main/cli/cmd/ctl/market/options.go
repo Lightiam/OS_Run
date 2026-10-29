@@ -1,0 +1,434 @@
+package market
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
+	"github.com/beclab/Olares/cli/pkg/clierr"
+	"github.com/beclab/Olares/cli/pkg/clusterclient"
+	"github.com/beclab/Olares/cli/pkg/cmdutil"
+)
+
+// errReported marks a command whose OperationResult has already been
+// printed. cmd/main.go recognises the shared sentinel and exits without
+// appending an error line of its own.
+var errReported = clierr.ErrAlreadyReported
+
+// MarketOptions is the per-command shared option bag. Identity (--user) and
+// transport (--host, --kubeconfig) flags from the legacy `app` tree are gone:
+// they are replaced by the currently-selected profile (switch with
+// `olares-cli profile use <name>`) wired through cmdutil.Factory, exactly
+// the way `olares-cli files` resolves identity.
+type MarketOptions struct {
+	factory *cmdutil.Factory
+
+	// Source still varies per command (some accept --source / -s; some don't),
+	// so it stays a per-command flag.
+	Source string
+
+	Output    string
+	Quiet     bool
+	NoHeaders bool
+
+	Version        string
+	AllSources     bool
+	Cascade        bool
+	Category       string
+	Envs           []string
+	EntranceTitles []string
+	DeleteData     bool
+	Title          string
+
+	// ComputeMode pins the install compute mode (--compute-mode) and maps
+	// to InstallRequest.SelectedGpuType. ComputeBinding holds the raw
+	// --compute-binding values (<node>:<device>[:<mem>]) for resume. Both
+	// are 1.12.6+ only; on 1.12.5 they are rejected (the backend uses a
+	// different, untouched code path).
+	ComputeMode    string
+	ComputeBinding []string
+
+	// Mine narrows the catalog list verb to the active profile's apps —
+	// the same set the Market UI's "My Terminus" tab shows. This is
+	// broader than "完成安装的应用 / completed installs": in-flight
+	// install / upgrade rows (`pending`, `downloading`, `installing`,
+	// `*Canceling`, `*CancelFailed`, `upgrading`, `resuming`, ...) and
+	// post-install failures (`installFailed` is hidden, but
+	// `upgradeFailed`, `stopFailed`, `resumeFailed`, `applyEnvFailed`,
+	// ... all surface) are also "the user's apps". The flag diverts
+	// `list` away from /market/data (catalog browse) toward
+	// /market/state (per-user state rows) and changes the default
+	// source-scope semantics — see runListInstalled.
+	Mine bool
+
+	// Watch-mode flags. Off by default so today's "fire and forget"
+	// scripts keep their current exit semantics; opt in per invocation.
+	// Defaults (15m / 2s) match the SPA's effective polling cadence and
+	// give enough headroom for the slowest install paths (image pulls)
+	// without inviting infinite hangs in CI.
+	Watch         bool
+	WatchTimeout  time.Duration
+	WatchInterval time.Duration
+
+	// FailOnCrashLoop ends an install / upgrade watch as soon as one of the
+	// app's containers is in a state it will not leave on its own.
+	FailOnCrashLoop bool
+
+	podProbe podProber
+}
+
+// newMarketOptions seeds MarketOptions with the factory the parent command
+// was constructed with. Default Output stays "table" to preserve current
+// behavior across all subcommands.
+func newMarketOptions(f *cmdutil.Factory) *MarketOptions {
+	return &MarketOptions{factory: f, Output: "table"}
+}
+
+func (o *MarketOptions) isJSON() bool {
+	return strings.EqualFold(strings.TrimSpace(o.Output), "json")
+}
+
+// isInteractive reports whether the CLI may prompt the user on stdin for a
+// compute mode / binding selection. We only prompt when stdin is a real TTY
+// and the invocation isn't asking for machine output (-q) or JSON (-o json) —
+// otherwise we fail with an actionable "pass --compute-mode/--compute-binding"
+// message so scripts and pipes never hang on a read.
+func (o *MarketOptions) isInteractive() bool {
+	if o.Quiet || o.isJSON() {
+		return false
+	}
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// info prints an informational message to stderr.
+// Suppressed in JSON and quiet modes.
+func (o *MarketOptions) info(format string, args ...interface{}) {
+	if o.Quiet || o.isJSON() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func (o *MarketOptions) addSourceFlag(cmd *cobra.Command, desc string) {
+	if desc == "" {
+		desc = "market source id (auto-detected when omitted)"
+	}
+	cmd.Flags().StringVarP(&o.Source, "source", "s", "", desc)
+}
+
+// addCommonFlags wires the flags shared by source-aware commands. After
+// dropping --user/--host/--kubeconfig (replaced by the currently-selected
+// profile), "common" effectively means just the source selector.
+func (o *MarketOptions) addCommonFlags(cmd *cobra.Command) {
+	o.addSourceFlag(cmd, "")
+}
+
+// addOutputFlags wires the universal output knobs every market verb
+// honors: -o/--output (table | json) and -q/--quiet. NoHeaders used to
+// live here too but is now wired separately via addNoHeadersFlag — only
+// the read / browse verbs that actually render row-oriented tables
+// (list / categories / get) expose it. Mutating verbs (install /
+// upgrade / stop / resume / uninstall / cancel / clone / upload /
+// delete) don't render tables, so --no-headers on them was a no-op
+// footgun in scripts (`market stop firefox --no-headers` silently
+// ignored the flag).
+// lifecycleJSONShape names the fields of the document every mutating
+// verb prints under -o json. It lives in --help rather than in the agent
+// skills for the same reason flag descriptions do: a shape transcribed
+// somewhere else is a second copy, and it drifts on the next field.
+//
+// The last paragraph is the part that is not derivable from the struct.
+// `status` and `finalState` are both present and answer different
+// questions: one is about the command, the other about the app, and
+// which state counts as a good one is not the same for every verb.
+const lifecycleJSONShape = `-o json prints one OperationResult document:
+
+  app          the app acted on; targetApp on a clone
+  operation    the verb that ran
+  status       accepted (request taken, server still working),
+               success (--watch saw it settle), or failed
+  message      what happened, and why on a failure
+  source       the market source resolved for this operation
+  version      the version installed, upgraded to, or acted on
+  user         the acting user
+  state        the row's state when the command returned
+  progress     a percentage the backend reports; unreliable, do not gate on it
+  finalState   --watch only: the state the row settled at
+  finalOpType  --watch only: the operation that state belongs to
+
+.status is the verdict on the command and .finalState is where the app
+landed; they are not interchangeable. A --watch run reports success once
+the row settles the way this verb intended, so that is what a script
+should test, along with the exit code. Read .finalState when you need
+the state itself — but what a good one looks like differs by verb, and
+"running" is only it for install, upgrade and restart. A successful stop
+settles at stopped and a successful uninstall at uninstalled, so a check
+written against "running" calls both of them failures.
+
+Without --watch, neither final* field is present and .status is
+accepted, meaning the server took the request — not that the app is up.`
+
+// describeLifecycleJSON appends the shape above to a verb's help, before
+// its examples if it has any -- a reader looking for the field list
+// should not have to scroll past a dozen command lines to reach it.
+func describeLifecycleJSON(cmd *cobra.Command) {
+	long := strings.TrimRight(cmd.Long, "\n")
+	if index := strings.Index(long, "\nExamples:"); index >= 0 {
+		cmd.Long = strings.TrimRight(long[:index], "\n") + "\n\n" + lifecycleJSONShape + "\n" + long[index:] + "\n"
+		return
+	}
+	cmd.Long = long + "\n\n" + lifecycleJSONShape + "\n"
+}
+
+func (o *MarketOptions) addOutputFlags(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&o.Output, "output", "o", "table", "output format: table, json")
+	cmd.Flags().BoolVarP(&o.Quiet, "quiet", "q", false, "suppress output; exit code indicates success/failure")
+}
+
+// addNoHeadersFlag exposes --no-headers on verbs that print row-oriented
+// tables — currently list / categories. Kept off mutating verbs and off
+// `get` by design:
+//
+//   - Mutating verbs (install / upgrade / stop / resume / uninstall /
+//     cancel / clone / upload / delete) don't render tables, so
+//     --no-headers was a no-op footgun in scripts that passed it
+//     expecting it to apply.
+//   - `get` renders a key:value detail layout (one record, fields
+//     like "Name: …", "Title: …") — closer to `kubectl describe`
+//     than to a row-oriented table. There are no "headers" to drop
+//     separately from the values; for machine-readable output use
+//     `-o json`. Earlier we exposed --no-headers on `get` too, but
+//     printAppDetail never honored it — the flag silently did
+//     nothing. Removing the surface is the right fix.
+//
+// The bool field is still owned by the shared MarketOptions struct so
+// the verb's runner can branch on `opts.NoHeaders` without reaching
+// back through the cobra command.
+func (o *MarketOptions) addNoHeadersFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&o.NoHeaders, "no-headers", false,
+		"omit table headers and the trailing summary row (only on list / categories; useful for piping into awk / cut)")
+}
+
+func (o *MarketOptions) addVersionFlag(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&o.Version, "version", "", "app version (default: latest available)")
+}
+
+func (o *MarketOptions) addAllSourcesFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&o.AllSources, "all-sources", "a", false, "include apps from all sources")
+}
+
+func (o *MarketOptions) addCascadeFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&o.Cascade, "cascade", false,
+		"apply to shared sub-charts on v2 multi-chart apps (auto-enabled for single-user CS apps when omitted; pass --cascade=false to override). On Olares 1.12.6+ CS/shared apps are force-cascaded and --cascade=false cannot disable it")
+}
+
+func (o *MarketOptions) addEnvFlag(cmd *cobra.Command) {
+	// StringArrayVar (not StringSliceVar) so a single value may contain commas
+	// (e.g. MODEL_SUPPORTS=tools,thinking). StringSliceVar splits on commas,
+	// which corrupts comma-bearing env values; matches the settings env commands.
+	cmd.Flags().StringArrayVar(&o.Envs, "env", nil, "set env var in KEY=VALUE format (repeatable; value may contain commas)")
+}
+
+// addComputeModeFlag wires --compute-mode on install (Olares 1.12.6+). When
+// omitted on an app that supports several compute modes, an interactive TTY
+// prompts a choice from the backend's computeModeSelect 422; non-interactive
+// sessions are told to pass this flag. On 1.12.5 the flag is rejected.
+func (o *MarketOptions) addComputeModeFlag(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&o.ComputeMode, "compute-mode", "",
+		"compute mode to install with (e.g. cpu, nvidia); only on Olares 1.12.6+. Omit to be prompted when the app supports multiple modes")
+}
+
+// addComputeBindingFlag wires --compute-binding on resume (Olares 1.12.6+).
+// Repeatable; each value is <node>:<device>[:<mem>] where the optional mem is
+// a MemorySlice allocation (Gi by default, or a Gi/Mi suffix, e.g. 8, 8Gi,
+// 512Mi). When omitted on an app that needs a binding, an interactive TTY
+// prompts a selection from the backend's computeBindingRequired 422;
+// non-interactive sessions are told to pass this flag. On 1.12.5 it is rejected.
+func (o *MarketOptions) addComputeBindingFlag(cmd *cobra.Command) {
+	cmd.Flags().StringArrayVar(&o.ComputeBinding, "compute-binding", nil,
+		"bind a compute device in <node>:<device>[:<mem>] form; mem accepts Gi/Mi (e.g. node:gpu-0:8 or node:gpu-0:512Mi). Repeatable; only on Olares 1.12.6+")
+}
+
+func (o *MarketOptions) addEntranceTitleFlag(cmd *cobra.Command) {
+	cmd.Flags().StringArrayVar(&o.EntranceTitles, "entrance-title", nil, "set cloned entrance title in NAME=TITLE format (repeatable; title may contain commas)")
+}
+
+func (o *MarketOptions) addDeleteDataFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&o.DeleteData, "delete-data", false,
+		"also delete the app's private data dir (drive/Data/<app>) when uninstalling; the node-local cache (cache/<node>/<app>) is cleared either way. Paths under drive/Home granted via the manifest's permission.userData are NEVER deleted — they belong to the user, not the app; remove them yourself with `olares-cli files rm`")
+}
+
+func (o *MarketOptions) addTitleFlag(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&o.Title, "title", "", "display title for the cloned app instance")
+}
+
+// addMineFlag wires --mine/-m onto verbs that can pivot from catalog
+// browse to "the active profile's apps" — the same set the Market UI's
+// "My Terminus" tab shows. Critically this is NOT the same as "已安装
+// 应用 / completed installs": in-flight install rows and post-install
+// failure / transitional rows are part of "my apps" and are listed here
+// (only the SPA's 6 `uninstalledAppStates` are hidden — see
+// notInstalledStates in types.go). Today this only applies to
+// `market list`, but kept here for parity with the other flag helpers
+// so future verbs (e.g. `categories --mine`) can reuse it.
+func (o *MarketOptions) addMineFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&o.Mine, "mine", "m", false,
+		"list the active profile's apps — mirrors the Market UI's My Terminus tab (includes in-flight installs/upgrades and failed rows; queries /market/state instead of the catalog)")
+}
+
+// addWatchFlags exposes --watch / --watch-timeout / --watch-interval on
+// every lifecycle-mutating verb. They are deliberately attached one-by-one
+// (rather than baked into addCommonFlags) because read-only verbs like
+// `list` / `get` / `status` have no use for them and we don't want them
+// showing up in those help blurbs.
+func (o *MarketOptions) addWatchFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&o.Watch, "watch", "w", false,
+		"block until the app reaches a terminal state (success or failure) before exiting; exit code reflects the verdict")
+	cmd.Flags().DurationVar(&o.WatchTimeout, "watch-timeout", 15*time.Minute,
+		"maximum total wall-clock to wait when --watch is set (e.g. 15m, 1h); no-op without --watch. Bump for image-pull-heavy installs (Stable Diffusion / Ollama: 30m–1h)")
+	cmd.Flags().DurationVar(&o.WatchInterval, "watch-interval", 2*time.Second,
+		"polling interval against /market/state when --watch is set (e.g. 1s for tight CI feedback, 5s for slow networks); no-op without --watch")
+}
+
+// explainNoSourceFlag is for the verbs that act on whichever installed row
+// matches the name, so callers reaching for -s learn to drop it.
+func explainNoSourceFlag(cmd *cobra.Command) {
+	cmdutil.ExplainMissingFlag(cmd,
+		fmt.Sprintf("'%s' takes no --source; it acts on the installed app whichever source it came from, so drop the flag", cmd.Name()),
+		"s", "source")
+}
+
+// addPodWatchFlags is for install / upgrade only: their watch is the one
+// that can sit on an in-flight row while the app's pods crash.
+func (o *MarketOptions) addPodWatchFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&o.FailOnCrashLoop, "fail-on-crashloop", false,
+		"with --watch, fail as soon as an app container is in CrashLoopBackOff / CreateContainerConfigError / RunContainerError instead of waiting for the market row; the operation itself keeps running")
+}
+
+// podProber returns the probe --watch uses to read the app's pods, or nil
+// when the profile cannot build one; the watch then follows the market row
+// alone.
+func (o *MarketOptions) podProber() podProber {
+	if o.podProbe != nil || o.factory == nil {
+		return o.podProbe
+	}
+	ctx := context.Background()
+	rp, err := o.factory.ResolveProfile(ctx)
+	if err != nil {
+		return nil
+	}
+	hc, err := o.factory.HTTPClient(ctx)
+	if err != nil {
+		return nil
+	}
+	o.podProbe = newClusterPodProber(clusterclient.NewClient(hc, rp))
+	return o.podProbe
+}
+
+// prepare resolves the active profile and returns a ready-to-use MarketClient
+// pointed at <MarketURL>/app-store/api/v2. Auth (X-Authorization injection +
+// refresh-on-401 retry) is handled transparently by the Factory's
+// refreshingTransport.
+//
+// Background context is fine here: ResolveProfile reads from the local
+// credential store and HTTPClient builds the http.Client lazily; neither is a
+// long-running call in practice. Per-call I/O context is set by the run*
+// callers when invoking client methods.
+func (o *MarketOptions) prepare() (*MarketClient, error) {
+	if o.factory == nil {
+		return nil, fmt.Errorf("internal error: market options not wired with cmdutil.Factory")
+	}
+
+	ctx := context.Background()
+	rp, err := o.factory.ResolveProfile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hc, err := o.factory.HTTPClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	uploadHC, err := o.factory.HTTPClientWithoutTimeout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NewMarketClient(hc, uploadHC, rp, strings.TrimSpace(o.Source)), nil
+}
+
+func (o *MarketOptions) failOp(op, app string, err error) error {
+	if o.Quiet {
+		return errReported
+	}
+	result := OperationResult{
+		App:       app,
+		Operation: op,
+		Status:    "failed",
+		Message:   err.Error(),
+	}
+	o.printResult(result)
+	return errReported
+}
+
+func (o *MarketOptions) printJSON(v interface{}) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(v)
+}
+
+func (o *MarketOptions) printResult(result OperationResult) {
+	if o.Quiet {
+		return
+	}
+	if o.isJSON() {
+		if err := o.printJSON(result); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode JSON output: %v\n", err)
+		}
+		return
+	}
+
+	writer := os.Stdout
+	appLabel := result.App
+	if result.TargetApp != "" && result.TargetApp != result.App {
+		appLabel = fmt.Sprintf("%s -> %s", result.App, result.TargetApp)
+	}
+
+	message := strings.TrimSpace(result.Message)
+	if message == "" {
+		switch result.Status {
+		case "accepted":
+			message = "request accepted"
+		case "success":
+			message = "completed successfully"
+		case "failed":
+			message = "request failed"
+		default:
+			message = "completed"
+		}
+	}
+
+	if result.Status == "failed" {
+		writer = os.Stderr
+		fmt.Fprintf(writer, "%s '%s' failed: %s\n", result.Operation, appLabel, message)
+	} else {
+		fmt.Fprintf(writer, "%s '%s': %s\n", result.Operation, appLabel, message)
+	}
+
+	if result.Source != "" {
+		fmt.Fprintf(writer, "  source: %s\n", result.Source)
+	}
+	if result.Version != "" {
+		fmt.Fprintf(writer, "  version: %s\n", result.Version)
+	}
+	if result.State != "" {
+		fmt.Fprintf(writer, "  state: %s\n", result.State)
+	}
+	if result.Progress != "" && result.Progress != "0.00" {
+		fmt.Fprintf(writer, "  progress: %s\n", result.Progress)
+	}
+}

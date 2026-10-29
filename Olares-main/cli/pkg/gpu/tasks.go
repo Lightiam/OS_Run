@@ -1,0 +1,896 @@
+package gpu
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	v1alpha1 "github.com/beclab/Olares/framework/app-service/api/sys.bytetrade.io/v1alpha1"
+	apputils "github.com/beclab/Olares/framework/app-service/pkg/utils"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/beclab/Olares/cli/pkg/clientset"
+	"github.com/beclab/Olares/cli/pkg/common"
+	cc "github.com/beclab/Olares/cli/pkg/core/common"
+	"github.com/beclab/Olares/cli/pkg/core/connector"
+	"github.com/beclab/Olares/cli/pkg/core/logger"
+	"github.com/beclab/Olares/cli/pkg/core/util"
+	k3sGpuTemplates "github.com/beclab/Olares/cli/pkg/gpu/templates"
+	"github.com/beclab/Olares/cli/pkg/manifest"
+	"github.com/beclab/Olares/cli/pkg/utils"
+
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	apixclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+// nvidiaContainerdDropIn is where nvidia-ctk writes the nvidia runtime settings.
+// Keeping them out of config.toml leaves the Olares-managed registry config
+// untouched; the path is pinned explicitly on both the write and the remove side
+// so the two stay in sync.
+const nvidiaContainerdDropIn = "/etc/containerd/conf.d/99-nvidia.toml"
+
+const nvidiaContainerToolkitVersion = "1.19.1-1"
+
+var nvidiaContainerToolkitPackages = []string{
+	"nvidia-container-toolkit",
+	"nvidia-container-toolkit-base",
+	"libnvidia-container-tools",
+	"libnvidia-container1",
+}
+
+type CheckWslGPU struct {
+}
+
+func (t *CheckWslGPU) CheckNvidiaSmiFileExists() bool {
+	var nvidiaSmiFile = "/usr/lib/wsl/lib/nvidia-smi"
+	return util.IsExist(nvidiaSmiFile)
+}
+
+func (t *CheckWslGPU) Execute(runtime *common.KubeRuntime) {
+	if !runtime.GetSystemInfo().IsWsl() {
+		return
+	}
+	exists := t.CheckNvidiaSmiFileExists()
+	if !exists {
+		return
+	}
+
+	stdout, _, err := util.Exec(context.Background(), "/usr/lib/wsl/lib/nvidia-smi -L|grep 'NVIDIA'|grep UUID", false, false)
+	if err != nil {
+		logger.Errorf("nvidia-smi not found")
+		return
+	}
+	if stdout == "" {
+		return
+	}
+
+	runtime.Arg.SetGPU(true)
+}
+
+type InstallCudaDriver struct {
+	common.KubeAction
+	manifest.ManifestAction
+}
+
+func (t *InstallCudaDriver) Execute(runtime connector.Runtime) error {
+	// the runfile builds the modules first and only then discovers that it
+	// cannot load them, so bail out before spending minutes on DKMS
+	if driver, devices, err := utils.DetectNovaBoundGPUs(runtime); err != nil {
+		logger.Warnf("failed to check whether the GPU is bound to the nova driver: %v", err)
+	} else if len(devices) > 0 {
+		return fmt.Errorf("GPU %s is bound to the in-tree %s driver, which prevents the NVIDIA driver from taking ownership of the device; please run `sudo olares-cli gpu disable-conflicts`, REBOOT your machine, and try again", strings.Join(devices, ", "), driver)
+	}
+
+	_, _ = runtime.GetRunner().SudoCmd("apt-get update", false, true)
+	// install build deps for dkms
+	if _, err := runtime.GetRunner().SudoCmd("DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dkms build-essential linux-headers-$(uname -r)", false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to install kernel build dependencies for nvidia runfile")
+	}
+
+	// fetch runfile from manifest
+	item, err := t.Manifest.Get("cuda-driver")
+	if err != nil {
+		return err
+	}
+	runfile := item.FilePath(t.BaseDir)
+	if !util.IsExist(runfile) {
+		return fmt.Errorf("failed to find %s binary in %s", item.Filename, runfile)
+	}
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("chmod +x %s", runfile), false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to chmod +x runfile")
+	}
+	// execute runfile with required flags
+	cmd := fmt.Sprintf("sh %s -z --no-x-check --allow-installation-with-running-driver --no-check-for-alternate-installs --dkms --rebuild-initramfs -s", runfile)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to install nvidia driver via runfile")
+	}
+
+	// now that the nvidia driver is installed,
+	// the nvidia-smi should work correctly,
+	// if not, a manual reboot is needed by the user
+	st, err := utils.GetNvidiaStatus(runtime)
+	if err != nil || st == nil || !st.Installed || st.Mismatch {
+		logger.Error("ERROR: nvidia driver has been installed, but is not running properly, please reboot the machine and try again")
+		os.Exit(1)
+	}
+
+	return nil
+}
+
+type UpdateNvidiaContainerToolkitSource struct {
+	common.KubeAction
+	manifest.ManifestAction
+}
+
+func (t *UpdateNvidiaContainerToolkitSource) Execute(runtime connector.Runtime) error {
+	var cmd string
+	gpgkey, err := t.Manifest.Get("libnvidia-gpgkey")
+	if err != nil {
+		return err
+	}
+
+	keyPath := gpgkey.FilePath(t.BaseDir)
+
+	if !util.IsExist(keyPath) {
+		return fmt.Errorf("failed to find %s binary in %s", gpgkey.Filename, keyPath)
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd("install -d -m 0755 /usr/share/keyrings", false, true); err != nil {
+		return err
+	}
+	keyringPath := "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+	cmd = fmt.Sprintf("gpg --batch --yes --dearmor -o %s %s", keyringPath, keyPath)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, true); err != nil {
+		return err
+	}
+
+	libnvidia, err := t.Manifest.Get("libnvidia-container.list")
+	if err != nil {
+		return err
+	}
+
+	libPath := libnvidia.FilePath(t.BaseDir)
+
+	if !util.IsExist(libPath) {
+		return fmt.Errorf("failed to find %s binary in %s", libnvidia.Filename, libPath)
+	}
+
+	// remove any conflicting libnvidia-container.list
+	_, err = runtime.GetRunner().SudoCmd("rm -rf /etc/apt/sources.list.d/*nvidia-container*.list", false, false)
+	if err != nil {
+		return err
+	}
+
+	dstPath := filepath.Join("/etc/apt/sources.list.d", filepath.Base(libPath))
+	cmd = fmt.Sprintf("cp %s %s", libPath, dstPath)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, true); err != nil {
+		return err
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("sed -i 's#^deb https://#deb [signed-by=%s] https://#' %s", keyringPath, dstPath), false, true); err != nil {
+		return err
+	}
+
+	// decide mirror based on OLARES_SYSTEM_CDN_SERVICE
+	var mirrorHost string
+	cdnService := t.KubeConf.Arg.OlaresCDNService
+	if cdnService != "" {
+		cdnRaw := cdnService
+		if !strings.HasPrefix(cdnRaw, "http") {
+			cdnRaw = "https://" + cdnRaw
+		}
+		if cdnURL, err := url.Parse(cdnRaw); err == nil {
+			host := cdnURL.Host
+			if host == "" {
+				host = cdnService
+			}
+			if strings.HasSuffix(host, "olares.cn") {
+				mirrorHost = "mirrors.ustc.edu.cn"
+			}
+		} else if strings.HasSuffix(cdnService, "olares.cn") {
+			mirrorHost = "mirrors.ustc.edu.cn"
+		}
+	}
+	if mirrorHost == "" {
+		return nil
+	}
+	cmd = fmt.Sprintf("sed -i 's#nvidia.github.io#%s#g' %s", mirrorHost, dstPath)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, false); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to switch nvidia container repo to mirror site")
+	}
+	return nil
+}
+
+type InstallNvidiaContainerToolkit struct {
+	common.KubeAction
+}
+
+func (t *InstallNvidiaContainerToolkit) Execute(runtime connector.Runtime) error {
+	// Clean up any stale drop-in from the buggy nvidia-ctk `config.d` location
+	// (nvidia-container-toolkit <=1.18.0 mistakenly wrote 99-nvidia.toml to
+	// /etc/containerd/config.d instead of conf.d). We no longer strip `imports`
+	// from config.toml: the base containerd config (v3) owns
+	// `imports = ["/etc/containerd/conf.d/*.toml"]`, and nvidia-ctk writes its
+	// drop-in under conf.d (see ConfigureContainerdRuntime).
+	staleDropInDir := "/etc/containerd/config.d"
+	if util.IsExist(staleDropInDir) {
+		if err := os.RemoveAll(staleDropInDir); err != nil {
+			return errors.Wrap(errors.WithStack(err), "Failed to remove stale containerd drop-in directory")
+		}
+	}
+	logger.Debugf("install nvidia-container-toolkit")
+	pinned := make([]string, 0, len(nvidiaContainerToolkitPackages))
+	for _, pkg := range nvidiaContainerToolkitPackages {
+		pinned = append(pinned, fmt.Sprintf("%s=%s", pkg, nvidiaContainerToolkitVersion))
+	}
+	cmd := fmt.Sprintf("apt-get update && sudo apt-get install -y --allow-downgrades %s jq", strings.Join(pinned, " "))
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to apt-get install nvidia-container-toolkit")
+	}
+	return nil
+}
+
+type PatchK3sDriver struct { // patch k3s on wsl
+	common.KubeAction
+}
+
+func (t *PatchK3sDriver) Execute(runtime connector.Runtime) error {
+	if !runtime.GetSystemInfo().IsWsl() {
+		return nil
+	}
+	var cmd = "find /usr/lib/wsl/drivers/ -name libcuda.so.1.1|head -1"
+	driverPath, err := runtime.GetRunner().SudoCmd(cmd, false, true)
+	if err != nil {
+		return err
+	}
+
+	if driverPath == "" {
+		logger.Infof("cuda driver not found")
+		return nil
+	} else {
+		logger.Infof("cuda driver found: %s", driverPath)
+	}
+
+	templateStr, err := util.Render(k3sGpuTemplates.K3sCudaFixValues, nil)
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), fmt.Sprintf("render template %s failed", k3sGpuTemplates.K3sCudaFixValues.Name()))
+	}
+
+	var fixName = "cuda_lib_fix.sh"
+	var fixPath = path.Join(runtime.GetBaseDir(), cc.PackageCacheDir, "gpu", "cuda_lib_fix.sh")
+	if err := util.WriteFile(fixPath, []byte(templateStr), cc.FileMode0755); err != nil {
+		return errors.Wrap(errors.WithStack(err), fmt.Sprintf("write file %s failed", fixPath))
+	}
+
+	var dstName = path.Join(common.BinDir, fixName)
+	if err := runtime.GetRunner().SudoScp(fixPath, dstName); err != nil {
+		return errors.Wrap(errors.WithStack(err), fmt.Sprintf("scp file %s to remote %s failed", fixPath, dstName))
+	}
+
+	cmd = fmt.Sprintf("echo 'ExecStartPre=-/usr/local/bin/%s' >> /etc/systemd/system/k3s.service", fixName)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, false); err != nil {
+		return err
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd("systemctl daemon-reload", false, false); err != nil {
+		return err
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd("apt install -y strace", false, false); err != nil {
+		return err
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd(dstName, false, false); err != nil {
+		return errors.Wrap(err, "failed to apply CUDA patch for WSL")
+	}
+
+	return nil
+}
+
+type ConfigureContainerdRuntime struct {
+	common.KubeAction
+}
+
+func (t *ConfigureContainerdRuntime) Execute(runtime connector.Runtime) error {
+	// Write nvidia's runtime settings to a drop-in imported by config.toml
+	// (imports = conf.d/*.toml) rather than editing config.toml in place. This
+	// keeps the Olares-managed registry config (config_path/certs.d) untouched, so
+	// docker.io mirrors survive an `nvidia-ctk runtime configure`. The drop-in path
+	// is set explicitly to avoid the nvidia-ctk <=1.18.0 conf.d/config.d bug.
+	cmd := fmt.Sprintf("nvidia-ctk runtime configure --runtime=containerd --set-as-default --config-source=file --drop-in-config=%s", nvidiaContainerdDropIn)
+	if _, err := runtime.GetRunner().SudoCmd(cmd, false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "Failed to nvidia-ctk runtime configure")
+	}
+
+	return nil
+}
+
+type InstallPlugin struct {
+	common.KubeAction
+}
+
+func (t *InstallPlugin) Execute(runtime connector.Runtime) error {
+	chartPath := path.Join(runtime.GetInstallerDir(), "wizard/config/gpu/hami")
+	appName := "hami"
+	ns := "kube-system"
+	config, err := ctrl.GetConfig()
+	if err != nil {
+		return err
+	}
+	actionConfig, settings, err := utils.InitConfig(config, ns)
+	if err != nil {
+		return err
+	}
+
+	var ctx, cancel = context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	vals := make(map[string]interface{})
+
+	if err := utils.UpgradeCharts(ctx, actionConfig, settings, appName, chartPath, "", ns, vals, false); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type CheckGpuStatus struct {
+	common.KubeAction
+}
+
+func (t *CheckGpuStatus) Execute(runtime connector.Runtime) error {
+	kubectlpath, err := util.GetCommand(common.CommandKubectl)
+	if err != nil {
+		return fmt.Errorf("kubectl not found")
+	}
+
+	// in a multi-node cluster there is one hami-device-plugin pod per GPU node,
+	// so we must only check the pod scheduled on the current node.
+	nodeName, err := os.Hostname()
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), "get hostname error")
+	}
+	nodeName = strings.ToLower(nodeName)
+
+	selector := "app.kubernetes.io/component=hami-device-plugin"
+	fieldSelector := fmt.Sprintf("spec.nodeName=%s", nodeName)
+	cmd := fmt.Sprintf("%s get pod -n kube-system -l '%s' --field-selector '%s' -o jsonpath='{.items[*].status.phase}'", kubectlpath, selector, fieldSelector)
+
+	rphase, _ := runtime.GetRunner().SudoCmd(cmd, false, false)
+	if rphase == "Running" {
+		return nil
+	}
+	return fmt.Errorf("GPU Container State is Pending")
+}
+
+type UpdateNodeGPUInfo struct {
+	common.KubeAction
+}
+
+func (u *UpdateNodeGPUInfo) Execute(runtime connector.Runtime) error {
+	client, err := clientset.NewKubeClient()
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), "kubeclient create error")
+	}
+
+	st, err := utils.GetNvidiaStatus(runtime)
+	if err != nil {
+		return err
+	}
+	if st == nil || !st.Installed {
+		logger.Info("NVIDIA driver is not installed")
+		return nil
+	}
+
+	supported := "false"
+	if st.Installed {
+		supported = "true"
+	}
+
+	driverVersion := st.DriverVersion
+	if st.Mismatch && st.LibraryVersion != "" {
+		driverVersion = st.LibraryVersion
+	}
+
+	// TODO:
+	gpuType := NvidiaCardType
+	switch {
+	case runtime.GetSystemInfo().IsGB10Chip():
+		gpuType = GB10ChipType
+	}
+
+	return SetNodeGpuModeLabel(context.Background(), client.CtrlRuntime(), gpuType, &driverVersion, &st.CudaVersion, &supported)
+}
+
+type RemoveNodeLabels struct {
+	common.KubeAction
+}
+
+func (u *RemoveNodeLabels) Execute(runtime connector.Runtime) error {
+	client, err := clientset.NewKubeClient()
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), "kubeclient create error")
+	}
+
+	return RemoveAllNodeGpuLabels(context.Background(), client.CtrlRuntime())
+}
+
+// RemoveNvidiaNodeLabels is the uninstall-time counterpart of RemoveNodeLabels:
+// it only clears the NVIDIA-owned labels so other accelerators on the node keep
+// advertising their modes.
+type RemoveNvidiaNodeLabels struct {
+	common.KubeAction
+}
+
+func (u *RemoveNvidiaNodeLabels) Execute(runtime connector.Runtime) error {
+	client, err := clientset.NewKubeClient()
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), "kubeclient create error")
+	}
+
+	return RemoveNvidiaNodeGpuLabels(context.Background(), client.CtrlRuntime())
+}
+
+// updateCurrentNodeLabels reads the node matching the local hostname, hands its
+// label map to mutate (which returns whether it changed anything) and persists
+// the result as a merge patch carrying only the labels that were touched.
+// Patching rather than updating the whole node avoids resourceVersion conflicts
+// with the kubelet and the controllers writing to the same object.
+func updateCurrentNodeLabels(ctx context.Context, client ctrlclient.Client, mutate func(labels map[string]string) bool) error {
+	nodeName, err := os.Hostname()
+	if err != nil {
+		logger.Error("get hostname error, ", err)
+		return err
+	}
+
+	var node corev1.Node
+	if err := client.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		logger.Error("get node error, ", err)
+		return err
+	}
+
+	// mutate edits the node's own label map, so snapshot it to diff against
+	patch := ctrlclient.MergeFrom(node.DeepCopy())
+
+	labels := node.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	if !mutate(labels) {
+		return nil
+	}
+	node.SetLabels(labels)
+
+	logger.Infof("patching node gpu labels for %s", nodeName)
+	if err := client.Patch(ctx, &node, patch); err != nil {
+		logger.Error("patch node error, ", err)
+		return err
+	}
+	return nil
+}
+
+// SetNodeGpuModeLabel marks the current node as supporting `mode` by setting
+// the existence label gpu.bytetrade.io/<mode>=true. The write is additive:
+// labels for other modes the node already advertises are left untouched, so a
+// node with several accelerators (e.g. nvidia + intel) accumulates one label
+// per mode. The optional driver / cuda / cudaSupported values refresh the
+// corresponding gpu.bytetrade.io/{driver,cuda,cuda-supported} labels (used by
+// the nvidia path); a nil pointer means "leave that label as-is". The legacy
+// gpu.bytetrade.io/type label is intentionally never written.
+func SetNodeGpuModeLabel(ctx context.Context, client ctrlclient.Client, mode string, driver, cuda, cudaSupported *string) error {
+	err := updateCurrentNodeLabels(ctx, client, func(labels map[string]string) bool {
+		update := false
+		if mode != "" && mode != CPUType {
+			key := GpuModeLabel(mode)
+			if labels[key] != "true" {
+				labels[key] = "true"
+				update = true
+			}
+		}
+		for _, label := range []struct {
+			key   string
+			value *string
+		}{
+			{GpuDriverLabel, driver},
+			{GpuCudaLabel, cuda},
+			{GpuCudaSupportedLabel, cudaSupported},
+		} {
+			if label.value == nil || *label.value == "" {
+				continue
+			}
+			if labels[label.key] != *label.value {
+				labels[label.key] = *label.value
+				update = true
+			}
+		}
+		return update
+	})
+	if err != nil {
+		return err
+	}
+
+	if cuda != nil && *cuda != "" {
+		if err := updateCudaVersionSystemEnv(ctx, *cuda); err != nil {
+			logger.Errorf("failed to update SystemEnv for CUDA version: %v", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// RemoveAllNodeGpuLabels strips every gpu.bytetrade.io GPU label from the
+// current node: the driver / cuda / cuda-supported labels, all per-mode
+// existence labels (gpu.bytetrade.io/<mode>), and the legacy
+// gpu.bytetrade.io/type label.
+func RemoveAllNodeGpuLabels(ctx context.Context, client ctrlclient.Client) error {
+	return removeNodeGpuLabels(ctx, client, AllGpuModeTypes)
+}
+
+// RemoveNvidiaNodeGpuLabels strips only the labels that the NVIDIA driver stack
+// owns: the nvidia per-mode existence labels, the driver / cuda /
+// cuda-supported labels and the legacy gpu.bytetrade.io/type label (which only
+// ever held nvidia values). Per-mode labels of other accelerators on the same
+// node are preserved, so uninstalling the NVIDIA driver on a machine that also
+// has an Intel iGPU doesn't silently drop its intel mode.
+func RemoveNvidiaNodeGpuLabels(ctx context.Context, client ctrlclient.Client) error {
+	return removeNodeGpuLabels(ctx, client, NvidiaGpuModeTypes)
+}
+
+// removeNodeGpuLabels deletes the per-mode existence labels for modes plus the
+// driver / cuda / cuda-supported and legacy type labels, which are all written
+// by the nvidia path and therefore never outlive it.
+func removeNodeGpuLabels(ctx context.Context, client ctrlclient.Client, modes []string) error {
+	return updateCurrentNodeLabels(ctx, client, func(labels map[string]string) bool {
+		update := false
+		del := func(key string) {
+			if _, ok := labels[key]; ok {
+				delete(labels, key)
+				update = true
+			}
+		}
+		del(GpuDriverLabel)
+		del(GpuCudaLabel)
+		del(GpuCudaSupportedLabel)
+		del(GpuType)
+		for _, mode := range modes {
+			del(GpuModeLabel(mode))
+		}
+		return update
+	})
+}
+
+func updateCudaVersionSystemEnv(ctx context.Context, cudaVersion string) error {
+	envName := "OLARES_SYSTEM_CUDA_VERSION"
+	common.SetSystemEnv(envName, cudaVersion)
+	config, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get rest config: %w", err)
+	}
+
+	apix, err := apixclientset.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create crd client: %w", err)
+	}
+
+	_, err = apix.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, "systemenvs.sys.bytetrade.io", metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Debugf("SystemEnv CRD not found, skipping CUDA version update")
+			return nil
+		}
+		return fmt.Errorf("failed to get SystemEnv CRD: %w", err)
+	}
+
+	scheme := kruntime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add systemenv scheme: %w", err)
+	}
+
+	c, err := ctrlclient.New(config, ctrlclient.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create client: %w", err)
+	}
+
+	resourceName, err := apputils.EnvNameToResourceName(envName)
+	if err != nil {
+		return fmt.Errorf("invalid system env name: %s", envName)
+	}
+
+	var existingSystemEnv v1alpha1.SystemEnv
+	err = c.Get(ctx, types.NamespacedName{Name: resourceName}, &existingSystemEnv)
+	if err == nil {
+		if existingSystemEnv.Default != cudaVersion {
+			existingSystemEnv.Default = cudaVersion
+			if err := c.Update(ctx, &existingSystemEnv); err != nil {
+				return fmt.Errorf("failed to update SystemEnv %s: %w", resourceName, err)
+			}
+			logger.Infof("Updated SystemEnv %s default to %s", resourceName, cudaVersion)
+		}
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get SystemEnv %s: %w", resourceName, err)
+	}
+
+	systemEnv := &v1alpha1.SystemEnv{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: resourceName,
+		},
+		EnvVarSpec: v1alpha1.EnvVarSpec{
+			EnvName: envName,
+			Default: cudaVersion,
+		},
+	}
+
+	if err := c.Create(ctx, systemEnv); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create SystemEnv %s: %w", resourceName, err)
+	}
+
+	logger.Infof("Created SystemEnv: %s with default %s", envName, cudaVersion)
+	return nil
+}
+
+type RemoveContainerRuntimeConfig struct {
+	common.KubeAction
+}
+
+func (t *RemoveContainerRuntimeConfig) Execute(runtime connector.Runtime) error {
+	// Deleting the drop-in is the exact inverse of ConfigureContainerdRuntime:
+	// the nvidia runtime lives entirely in that file, and the base config.toml
+	// still declares runc as the default runtime. Editing config.toml the way
+	// this used to is both unnecessary and impossible now — containerd's own
+	// loader caps at config version 2 and resolves `imports`, so it fails on a
+	// current install and took the whole uninstall down with it.
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("rm -f %s", nvidiaContainerdDropIn), false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), fmt.Sprintf("failed to remove the nvidia containerd drop-in %s", nvidiaContainerdDropIn))
+	}
+
+	return nil
+}
+
+type UninstallNvidiaDrivers struct {
+	common.KubeAction
+}
+
+func (t *UninstallNvidiaDrivers) Execute(runtime connector.Runtime) error {
+	_, _ = runtime.GetRunner().SudoCmd("DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge", false, true)
+	_, _ = runtime.GetRunner().SudoCmd("dpkg --configure -a || true", false, true)
+	listCmd := "dpkg -l | awk '/^(ii|i[UuFHWt]|rc|..R)/ {print $2}' | grep nvidia | grep -v container"
+	pkgs, _ := runtime.GetRunner().SudoCmd(listCmd, false, false)
+	pkgs = strings.ReplaceAll(pkgs, "\n", " ")
+	pkgs = strings.TrimSpace(pkgs)
+	if pkgs != "" {
+		removeCmd := fmt.Sprintf("DEBIAN_FRONTEND=noninteractive apt-get -y --auto-remove --purge remove %s", pkgs)
+		if _, err := runtime.GetRunner().SudoCmd(removeCmd, false, true); err != nil {
+			return errors.Wrap(errors.WithStack(err), "failed to remove nvidia packages via apt-get")
+		}
+		_, _ = runtime.GetRunner().SudoCmd("DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge", false, true)
+	}
+
+	// also try to uninstall runfile-installed drivers if present
+	if out, _ := runtime.GetRunner().SudoCmd("test -x /usr/bin/nvidia-uninstall && echo yes || true", false, false); strings.TrimSpace(out) == "yes" {
+		if _, err := runtime.GetRunner().SudoCmd("/usr/bin/nvidia-uninstall -s", false, true); err != nil {
+			return errors.Wrap(errors.WithStack(err), "failed to uninstall NVIDIA driver via nvidia-uninstall")
+		}
+	} else if out2, _ := runtime.GetRunner().SudoCmd("test -x /usr/bin/nvidia-installer && echo yes || true", false, false); strings.TrimSpace(out2) == "yes" {
+		if _, err := runtime.GetRunner().SudoCmd("/usr/bin/nvidia-installer --uninstall -s", false, true); err != nil {
+			return errors.Wrap(errors.WithStack(err), "failed to uninstall NVIDIA driver via nvidia-installer --uninstall")
+		}
+	}
+
+	// clean up any leftover dkms-installed kernel modules for nvidia if present
+	// only remove .ko files under updates/dkms to avoid removing other modules
+	checkLeftoverCmd := "sh -c 'test -d /lib/modules/$(uname -r)/updates/dkms && find /lib/modules/$(uname -r)/updates/dkms -maxdepth 1 -type f -name \"nvidia*.ko\" -print -quit | grep -q . && echo yes || true'"
+	if out, _ := runtime.GetRunner().SudoCmd(checkLeftoverCmd, false, false); strings.TrimSpace(out) == "yes" {
+		if _, err := runtime.GetRunner().SudoCmd("find /lib/modules/$(uname -r)/updates/dkms -maxdepth 1 -type f -name 'nvidia*.ko' -print -delete", false, true); err != nil {
+			return errors.Wrap(errors.WithStack(err), "Failed to remove leftover nvidia dkms kernel modules")
+		}
+		// refresh module dependency maps
+		if _, err := runtime.GetRunner().SudoCmd("depmod -a $(uname -r)", false, true); err != nil {
+			logger.Error("Failed to refresh module dependency maps: ", err)
+		}
+	}
+
+	return nil
+}
+
+type PrintGpuStatus struct {
+	common.KubeAction
+}
+
+func (t *PrintGpuStatus) Execute(runtime connector.Runtime) error {
+	st, err := utils.GetNvidiaStatus(runtime)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		logger.Info("no NVIDIA GPU status available")
+		return nil
+	}
+	// basic status
+	logger.Infof("Installed: %t", st.Installed)
+	if st.Installed {
+		logger.Infof("Install method: %s", st.InstallMethod)
+	}
+	logger.Infof("Running: %t", st.Running)
+	// running (kernel) driver version
+	if st.Running && strings.TrimSpace(st.DriverVersion) != "" {
+		logger.Infof("Running driver version (kernel): %s", st.DriverVersion)
+	}
+	// userland info from nvidia-smi (when available)
+	if st.Installed {
+		if st.Info != nil && strings.TrimSpace(st.Info.DriverVersion) != "" {
+			logger.Infof("Installed driver version (nvidia-smi): %s", st.Info.DriverVersion)
+		}
+		if strings.TrimSpace(st.CudaVersion) != "" {
+			logger.Infof("CUDA version (nvidia-smi): %s", st.CudaVersion)
+		}
+		if st.Mismatch {
+			if strings.TrimSpace(st.LibraryVersion) != "" {
+				logger.Warnf("Driver/library version mismatch, NVML library version: %s", st.LibraryVersion)
+			} else {
+				logger.Warn("Driver/library version mismatch detected")
+			}
+		}
+	}
+	if !st.Installed && !st.Running {
+		logger.Info("no NVIDIA driver detected (neither installed nor running)")
+	}
+	return nil
+}
+
+type PrintPluginsStatus struct {
+	common.KubeAction
+}
+
+func (t *PrintPluginsStatus) Execute(runtime connector.Runtime) error {
+	client, err := clientset.NewKubeClient()
+	if err != nil {
+		return errors.Wrap(errors.WithStack(err), "kubeclient create error")
+	}
+
+	plugins, err := client.Kubernetes().CoreV1().Pods("kube-system").List(context.Background(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/component=hami-device-plugin"})
+	if err != nil {
+		logger.Error("get plugin status error, ", err)
+		return err
+	}
+
+	if len(plugins.Items) == 0 {
+		logger.Info("hami-device-plugin not exists")
+
+	} else {
+		for _, plugin := range plugins.Items {
+			logger.Infof("hami-device-plugin status: %s", plugin.Status.Phase)
+			break
+		}
+	}
+
+	gpuScheduler, err := client.Kubernetes().CoreV1().Pods("os-gpu").List(context.Background(), metav1.ListOptions{LabelSelector: "name=gpu-scheduler"})
+	if err != nil {
+		logger.Error("get gpu-scheduler status error, ", err)
+	}
+
+	if len(gpuScheduler.Items) == 0 {
+		logger.Info("gpu-scheduler not exists")
+	} else {
+		for _, scheduler := range gpuScheduler.Items {
+			logger.Infof("node: %s gpu-scheduler status: %s", scheduler.Spec.NodeName, scheduler.Status.Phase)
+			break
+		}
+	}
+
+	return nil
+}
+
+type RestartPlugin struct {
+	common.KubeAction
+}
+
+func (t *RestartPlugin) Execute(runtime connector.Runtime) error {
+	kubectlpath, err := util.GetCommand(common.CommandKubectl)
+	if err != nil {
+		return fmt.Errorf("kubectl not found")
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("%s rollout restart ds gpu-scheduler -n os-gpu", kubectlpath), false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "Failed to restart gpu-scheduler")
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("%s rollout restart ds hami-device-plugin -n kube-system", kubectlpath), false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "Failed to restart hami-device-plugin")
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd(fmt.Sprintf("%s rollout restart deploy hami-scheduler -n kube-system", kubectlpath), false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "Failed to restart hami-scheduler")
+	}
+
+	return nil
+}
+
+// conflictingGPUDriverModules are the in-tree NVIDIA drivers that bind the card
+// on boot and keep the proprietary driver from ever getting a probe. nouveau is
+// the historical one; nova is its Rust successor, which claims every Turing or
+// later card and is shipped as a module by some distro kernels (Ubuntu 26.04's
+// 7.0 kernel among them) even though it is still non-functional. The DRM half
+// is called nova on some kernels and nova_drm on others, so both are listed.
+var ConflictingGPUDriverModules = []string{"nouveau", "lbm-nouveau", "nova", "nova_core", "nova_drm"}
+
+const (
+	modprobeDir = "/usr/lib/modprobe.d"
+	// gpuDriverBlacklistFile holds the blacklist for all of the above.
+	gpuDriverBlacklistFile = modprobeDir + "/olares-disable-conflicting-gpu-drivers.conf"
+	// legacyNouveauBlacklistFile is the nouveau-only drop-in written by earlier
+	// Olares versions, dropped so the blacklist lives in exactly one file.
+	legacyNouveauBlacklistFile = modprobeDir + "/olares-disable-nouveau.conf"
+)
+
+type WriteConflictingGPUDriverBlacklist struct {
+	common.KubeAction
+}
+
+func (t *WriteConflictingGPUDriverBlacklist) Execute(runtime connector.Runtime) error {
+	if !runtime.GetSystemInfo().IsLinux() {
+		return nil
+	}
+
+	var content strings.Builder
+	for _, m := range ConflictingGPUDriverModules {
+		fmt.Fprintf(&content, "blacklist %s\n", m)
+	}
+	for _, m := range ConflictingGPUDriverModules {
+		fmt.Fprintf(&content, "alias %s off\n", m)
+	}
+
+	if _, err := runtime.GetRunner().SudoCmd("install -d -m 0755 "+modprobeDir, false, true); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to ensure "+modprobeDir+" exists")
+	}
+
+	tmpPath := path.Join(runtime.GetBaseDir(), cc.PackageCacheDir, "gpu", path.Base(gpuDriverBlacklistFile))
+	if err := os.MkdirAll(path.Dir(tmpPath), 0755); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to create temp dir for GPU driver blacklist")
+	}
+	if err := util.WriteFile(tmpPath, []byte(content.String()), 0644); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to write temp GPU driver blacklist file")
+	}
+	if err := runtime.GetRunner().SudoScp(tmpPath, gpuDriverBlacklistFile); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to install GPU driver blacklist file")
+	}
+	if _, err := runtime.GetRunner().SudoCmd("rm -f "+legacyNouveauBlacklistFile, false, false); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to remove legacy nouveau blacklist file")
+	}
+
+	// -k all matters here: a machine that still has an older kernel installed
+	// can boot into it, and only that kernel may be the one shipping nova
+	if _, err := runtime.GetRunner().SudoCmd("update-initramfs -u -k all", false, false); err != nil {
+		return errors.Wrap(errors.WithStack(err), "failed to update initramfs")
+	}
+
+	var loaded []string
+	for _, m := range ConflictingGPUDriverModules {
+		// /sys/module always spells the module name with underscores
+		sysName := strings.ReplaceAll(m, "-", "_")
+		out, _ := runtime.GetRunner().SudoCmd(fmt.Sprintf("test -d /sys/module/%s && echo loaded || true", sysName), false, false)
+		if strings.TrimSpace(out) == "loaded" {
+			loaded = append(loaded, m)
+		}
+	}
+	if len(loaded) > 0 {
+		logger.Infof("the disable file for conflicting GPU kernel modules has been written, but the following module(s) are currently loaded: %s. Please REBOOT your machine to make the disabling effective.", strings.Join(loaded, ", "))
+		os.Exit(0)
+	}
+	return nil
+}

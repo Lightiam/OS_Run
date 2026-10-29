@@ -1,0 +1,85 @@
+name: Publish mdns-agent to Dockerhub
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        required: true
+
+jobs:
+  update_dockerhub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASS }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          push: true
+          context: ./daemon
+          tags: beclab/olaresd:${{ inputs.version }}
+          file: ./daemon/docker/Dockerfile.agent
+          platforms: linux/amd64,linux/arm64
+
+  upload_release_package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+      - name: Add Local Git Tag For GoReleaser
+        run: git tag ${{ inputs.version }}
+        continue-on-error: true
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.22.1
+
+      - name: Install x86_64 cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Install ARM cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v3.1.0
+        env:
+          GORELEASER_CURRENT_TAG: ${{ inputs.version }}
+        with:
+          distribution: goreleaser
+          version: v1.18.2
+          args: release --clean --skip-validate -f .goreleaser.agent.yml
+          workdir: './daemon'
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      - name: Upload to CDN
+        run: |
+          cd daemon/output && for file in *.tar.gz; do
+            coscmd upload "$file" ${{ secrets.REPO_PATH }}$file
+          done

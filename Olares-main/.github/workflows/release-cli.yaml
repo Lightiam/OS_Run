@@ -1,0 +1,429 @@
+name: Release CLI
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      ref:
+        type: string
+      repository:
+        type: string
+      release-id:
+        type: string
+      binary-version:
+        type: string
+      publish-npm:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Git branch to build from'
+        type: string
+        default: main
+      version:
+        description: 'npm version and CDN tar name (e.g. 1.12.6-cli.5)'
+        type: string
+        required: true
+      binary-version:
+        description: 'Go binary VERSION (OS line, e.g. 1.12.6). Defaults from version.'
+        type: string
+      ref:
+        type: string
+      repository:
+        type: string
+      release-id:
+        type: string
+      publish-npm:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      npm_version: ${{ steps.resolve.outputs.npm_version }}
+      binary_version: ${{ steps.resolve.outputs.binary_version }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+    steps:
+      - name: Resolve npm and binary versions
+        id: resolve
+        env:
+          VERSION: ${{ inputs.version }}
+          BINARY_VERSION: ${{ inputs.binary-version }}
+          REF: ${{ inputs.ref }}
+          BRANCH: ${{ inputs.branch }}
+          PUBLISH_NPM: ${{ inputs.publish-npm }}
+        run: |
+          set -euo pipefail
+          npm_ver="${VERSION}"
+          bin_ver="${BINARY_VERSION}"
+
+          # An explicit binary-version must be a clean OS-line semver so the
+          # upgrade framework can parse it (cli/pkg/upgrade/version.go).
+          if [ -n "$bin_ver" ] && ! echo "$bin_ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::binary-version '$bin_ver' must match X.Y.Z (OS line)"
+            exit 1
+          fi
+
+          if [ "$PUBLISH_NPM" = "true" ]; then
+            # The publish path is the iterating CLI line; enforce the canonical
+            # npm version so package.json/CDN names and the derived binary
+            # version stay well-formed.
+            if ! echo "$npm_ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+-cli\.[0-9]+$'; then
+              echo "::error::version '$npm_ver' must match X.Y.Z-cli.N when publishing to npm"
+              exit 1
+            fi
+            if [ -z "$bin_ver" ]; then
+              bin_ver=$(echo "$npm_ver" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-cli\.[0-9]+$/\1/')
+            fi
+          elif [ -z "$bin_ver" ]; then
+            # Non-publish callers (daily/check/release) build from their own
+            # version forms (1.12.8-<date>, 1.12.8-<random>, a release tag);
+            # keep the previous behavior and reuse the npm version as-is.
+            if echo "$npm_ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+-cli\.[0-9]+$'; then
+              bin_ver=$(echo "$npm_ver" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-cli\.[0-9]+$/\1/')
+            else
+              bin_ver="$npm_ver"
+            fi
+          fi
+
+          checkout_ref="${REF:-${BRANCH}}"
+          echo "npm_version=$npm_ver" >> "$GITHUB_OUTPUT"
+          echo "binary_version=$bin_ver" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+          echo "npm_version=$npm_ver binary_version=$bin_ver checkout_ref=$checkout_ref"
+
+  goreleaser:
+    needs: [resolve-versions]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: ${{ needs.resolve-versions.outputs.checkout_ref }}
+          repository: ${{ inputs.repository }}
+
+      - name: Preflight npm version (publish only)
+        if: ${{ inputs.publish-npm }}
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          if npm view "@olares/cli@${NPM_VERSION}" version 2>/dev/null; then
+            echo "::error::@olares/cli@${NPM_VERSION} already exists on npm"
+            exit 1
+          fi
+
+      # GoReleaser derives .Version from the current git tag. This workflow
+      # never pushes tags; the tag is local only. When building from an
+      # already-tagged ref (e.g. release.yaml builds from an existing tag),
+      # the tag is already present, so tolerate the failure.
+      - name: Add local git tag for GoReleaser
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: git tag "${NPM_VERSION}" || true
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.25.0
+
+      # The suite is compiled into the binary, so the release it ships in is a
+      # fact about this build. It used to be twelve hand-written `version:`
+      # lines edited in the release PR — a step that can be skipped, and one
+      # whose skipping is invisible: the skills ship new content under the
+      # label the user already installed, so nothing tells them their copy is
+      # behind. What is committed is a placeholder; nothing here is preserved.
+      - name: Stamp the release into the embedded skills
+        working-directory: cli
+        env:
+          PUBLISH_NPM: ${{ inputs.publish-npm }}
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+          BINARY_VERSION: ${{ needs.resolve-versions.outputs.binary_version }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH_NPM" = "true" ]; then
+            # What a user can ask npm for is what the skills should name.
+            stamp="$NPM_VERSION"
+          else
+            # Every other path — daily, a PR check, a build from a release tag
+            # — names an OS-line release and no CLI iteration inside it, and
+            # .0 says exactly that.
+            release=$(echo "${BINARY_VERSION#v}" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)
+            if [ -z "$release" ]; then
+              echo "::warning::binary version '${BINARY_VERSION}' names no X.Y.Z release; the embedded skills keep their placeholder version"
+              exit 0
+            fi
+            stamp="${release}-cli.0"
+          fi
+          python3 skills/stamp.py "$stamp"
+          git --no-pager diff --stat -- skills
+
+      # --skip-validate because the step above leaves the working tree dirty
+      # on purpose. It is the only thing that writes here, the diff it made is
+      # in the log above, and the tag GoReleaser reads was created by this job
+      # at this commit — so the two checks being skipped are ones this job has
+      # already made for itself.
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v3.1.0
+        with:
+          distribution: goreleaser
+          workdir: './cli'
+          version: v1.18.2
+          args: release --clean --skip-validate
+        env:
+          GORELEASER_CURRENT_TAG: ${{ needs.resolve-versions.outputs.npm_version }}
+          OLARES_RELEASE_ID: ${{ inputs.release-id }}
+          BINARY_VERSION: ${{ needs.resolve-versions.outputs.binary_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assert binary version was injected
+        working-directory: cli
+        env:
+          EXPECTED_BINARY_VERSION: ${{ needs.resolve-versions.outputs.binary_version }}
+        run: |
+          set -euo pipefail
+          binary=$(find ./output -type f -name 'olares-cli' -path '*linux_amd64*' | head -n1)
+          if [ -z "$binary" ]; then
+            echo "::error::could not locate built linux_amd64 olares-cli binary under cli/output"
+            find ./output -maxdepth 2 -type f | sed 's/^/  /'
+            exit 1
+          fi
+          actual=$("$binary" --version 2>&1)
+          expected="${EXPECTED_BINARY_VERSION#v}"
+          if echo "$actual" | grep -qE '0\.0\.0-development'; then
+            echo "::error::binary still reports placeholder version; ldflags did not take effect"
+            echo "binary: $binary"
+            echo "output: $actual"
+            exit 1
+          fi
+          if ! echo "$actual" | grep -qF "$expected"; then
+            echo "::error::binary version output '$actual' does not contain expected '$expected'"
+            exit 1
+          fi
+          if ! echo "$actual" | grep -qE '^Git commit: '; then
+            echo "::error::binary version output is missing the 'Git commit:' line"
+            echo "output: $actual"
+            exit 1
+          fi
+          if ! echo "$actual" | grep -qE '^Build time: '; then
+            echo "::error::binary version output is missing the 'Build time:' line"
+            echo "output: $actual"
+            exit 1
+          fi
+          if echo "$actual" | grep -qE '^(Git commit|Build time): unknown$'; then
+            echo "::error::build metadata still reports 'unknown'; ldflags did not take effect"
+            echo "output: $actual"
+            exit 1
+          fi
+          echo "binary version OK:"
+          echo "$actual"
+
+      # The suite is compiled in, so a release can ship a binary that builds,
+      # runs, reports the right version — and carries eleven skills because an
+      # embed pattern stopped matching one. Nothing else in this job would
+      # notice: the missing skill is a file an agent is told to read and
+      # cannot. Counting against the checkout rather than against 12 is the
+      # point; the number is whatever the tree holds.
+      - name: Assert the skills are embedded
+        working-directory: cli
+        run: |
+          set -euo pipefail
+          binary=$(find ./output -type f -name 'olares-cli' -path '*linux_amd64*' | head -n1)
+          expected=$(find skills -mindepth 2 -maxdepth 2 -name SKILL.md -path 'skills/olares-*' | wc -l | tr -d ' ')
+          if [ "$expected" -lt 2 ]; then
+            echo "::error::found $expected skills in the checkout; this assertion is not looking where the suite lives"
+            exit 1
+          fi
+          listed=$("$binary" skills list -o json | jq '.skills | length')
+          if [ "$listed" != "$expected" ]; then
+            echo "::error::the binary carries $listed skills; the checkout has $expected"
+            "$binary" skills list -o json | jq -r '.skills[].name' | sed 's/^/  carried: /'
+            exit 1
+          fi
+          versions=$("$binary" skills list -o json | jq -r '[.skills[].version] | unique | .[]')
+          if [ "$(echo "$versions" | wc -l | tr -d ' ')" != "1" ]; then
+            echo "::error::the embedded suite declares more than one version:"
+            echo "$versions" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "embedded skills OK: $listed at $versions"
+
+      # A skill's version is the release it ships in, and the stamp above is
+      # what puts it there. This asserts the stamp reached the binary — the
+      # same job as `Assert binary version was injected`, for the same reason:
+      # a step that silently did nothing produces a release whose skills name
+      # a version nobody released, and the number is what a user is shown when
+      # their installed copy turns out to be from somewhere else.
+      #
+      # It runs on every path, because every path stamps. Only the X.Y.Z
+      # prefixes are compared: the two lines number differently past that
+      # (1.12.8 and 1.12.8-cli.4 are the same release).
+      - name: Assert the embedded skills name the release being built
+        working-directory: cli
+        env:
+          BINARY_VERSION: ${{ needs.resolve-versions.outputs.binary_version }}
+        run: |
+          set -euo pipefail
+          release=$(echo "${BINARY_VERSION#v}" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ -z "$release" ]; then
+            echo "::notice::binary version '${BINARY_VERSION}' names no X.Y.Z release; nothing to compare the skills against"
+            exit 0
+          fi
+          binary=$(find ./output -type f -name 'olares-cli' -path '*linux_amd64*' | head -n1)
+          declared=$("$binary" skills list -o json | jq -r '.skills[0].version')
+          prefix=$(echo "$declared" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ "$prefix" != "$release" ]; then
+            echo "::error::the embedded skills declare ${declared}, but this build releases ${release}."
+            echo "The stamp did not reach the binary; check 'Stamp the release into the embedded skills' above."
+            exit 1
+          fi
+          echo "embedded skills name this release: $declared"
+
+      # The publish path can be exact: the npm version is the skill version.
+      - name: Assert the embedded skills name this npm release
+        if: ${{ inputs.publish-npm }}
+        working-directory: cli
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          binary=$(find ./output -type f -name 'olares-cli' -path '*linux_amd64*' | head -n1)
+          declared=$("$binary" skills list -o json | jq -r '.skills[0].version')
+          if [ "$declared" != "$NPM_VERSION" ]; then
+            echo "::error::the embedded skills declare ${declared}, but this release publishes ${NPM_VERSION}."
+            echo "The stamp did not reach the binary; check 'Stamp the release into the embedded skills' above."
+            exit 1
+          fi
+          echo "embedded skills name this release: $declared"
+
+      # The checksums GoReleaser just computed are the root of trust for the
+      # npm postinstall: it hashes what it downloaded and refuses to extract
+      # an archive that does not match (cli/npm/scripts/install.js). The
+      # publish job checks out the repository fresh, so the file has to
+      # travel as an artifact -- recomputing it there would hash whatever the
+      # CDN served, which is the thing being verified.
+      - name: Upload checksums for the npm package
+        if: ${{ inputs.publish-npm }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: olares-cli-checksums
+          path: cli/output/checksums.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Install coscmd
+        run: pip install coscmd
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION
+
+      - name: Upload to CDN
+        run: |
+          cd cli/output && for file in $(ls *.tar.gz | grep -v no-release-id); do
+            coscmd upload "$file" ${{ secrets.REPO_PATH }}${file}
+          done
+
+      # Verify the exact URL @olares/cli postinstall fetches (see
+      # cli/npm/scripts/install.js: `${CDN_BASE}/${name}`, no REPO_PATH prefix).
+      - name: Verify CDN tar for npm postinstall (publish only)
+        if: ${{ inputs.publish-npm }}
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          for arch in linux_amd64 darwin_arm64; do
+            file="olares-cli-v${NPM_VERSION}_${arch}.tar.gz"
+            url="https://cdn.olares.com/${file}"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$url" || true)
+            if [ "$code" != "200" ]; then
+              echo "::error::CDN asset not reachable: ${url} (HTTP ${code})"
+              exit 1
+            fi
+            echo "CDN OK: ${url}"
+          done
+
+  publish-npm:
+    needs: [resolve-versions, goreleaser]
+    if: ${{ inputs.publish-npm }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          ref: ${{ needs.resolve-versions.outputs.checkout_ref }}
+          repository: ${{ inputs.repository }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Lands at cli/npm/checksums.txt, which package.json lists under "files"
+      # so it is packed into the published tarball. prepublishOnly
+      # (scripts/check-version.js) fails the publish if it is missing or names
+      # a different build than the version being published.
+      - name: Download checksums into the npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: olares-cli-checksums
+          path: cli/npm
+
+      # The postinstall's integrity check is reached only by `npm install` on
+      # a user's machine, so this is the one place in the pipeline that
+      # exercises it before it ships.
+      - name: Test the postinstall verification
+        working-directory: cli/npm
+        run: npm test
+
+      - name: Verify the checksums match this release
+        working-directory: cli/npm
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: |
+          set -euo pipefail
+          test -s checksums.txt
+          for arch in linux_amd64 linux_arm64 linux_arm darwin_amd64 darwin_arm64 windows_amd64 windows_arm64; do
+            file="olares-cli-v${NPM_VERSION}_${arch}.tar.gz"
+            if ! grep -qE "^[0-9a-f]{64}  ${file}\$" checksums.txt; then
+              echo "::error::checksums.txt has no entry for ${file}; postinstall would fail closed on that platform"
+              cat checksums.txt
+              exit 1
+            fi
+          done
+          echo "checksums OK for every published platform:"
+          cat checksums.txt
+
+      - name: Sync npm package.json version
+        working-directory: cli/npm
+        env:
+          NPM_VERSION: ${{ needs.resolve-versions.outputs.npm_version }}
+        run: |
+          npm version "$NPM_VERSION" \
+            --no-git-tag-version \
+            --allow-same-version
+
+      - name: Publish @olares/cli (dist-tag next)
+        working-directory: cli/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_OLARES_PUBLISH_TOKEN }}
+        run: npm publish --access public --tag next

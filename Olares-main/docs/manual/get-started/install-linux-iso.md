@@ -1,0 +1,92 @@
+---
+outline: [2, 3]
+description: Install Olares on a physical Linux machine from a bootable USB drive, then activate it with LarePass.
+head:
+  - - meta
+    - name: keywords
+      content: Olares, Linux ISO, physical machine, bootable USB, Balena Etcher, Ubuntu
+---
+
+# Install Olares via ISO
+
+This guide explains how to install Olares on a physical machine using the official ISO image.
+
+:::warning Installing on Olares One?
+This ISO is for self-hosted x86-64 hardware. For Olares One, follow the [Olares One ISO guide](/one/create-bootable-usb) and use the device-specific image to keep Olares One features available.
+:::
+
+## Prerequisites
+
+- **Olares device**: A physical machine that meets the [Linux system requirements](install-olares.md#linux).
+- **Processor**: Intel or AMD x86-64. ARM is not supported.
+<!--@include: ./reusables.md#larepass-prerequisite-->
+- **Network**: A wired LAN connection.
+- **USB flash drive**: At least 16 GB of capacity.
+- **Setup computer**: A Windows, macOS, or Linux computer for creating the bootable USB drive.
+
+## Create a bootable USB drive
+
+1. Download the [latest Olares ISO image for self-hosted hardware](https://cdn.olares.com/olares-v1.12.7-amd64.iso).
+2. Download and install [**Balena Etcher**](https://etcher.balena.io/).
+3. Insert the USB flash drive into your computer.
+4. Launch Etcher and follow these steps:
+   ![Bootable USB](/images/manual/get-started/iso-flash.png#bordered)
+   a. **Image**: Select the Olares ISO.
+   
+   b. **Target disk**: Select your USB drive.
+
+   c. Click **Flash** to write the installer to the USB drive.
+
+## Boot from USB drive
+
+1. Insert the bootable USB drive into the target machine.
+2. Enter the BIOS setup and set USB Boot as the first boot option.
+3. Save and restart. The system will automatically boot into the Olares installer interface.
+
+## Install Olares
+
+1. From the Olares installer interface, select **Install Olares to Hard Disk** and press **Enter**.
+2. The installer will display a list of available disks (e.g., `sda 200G HARDDISK`).  
+   Type `/dev/` followed by the disk name (e.g., `/dev/sda`) to select the installation target. The installation typically takes **4–5 minutes**.
+   :::tip Note
+   During installation, you may see prompts related to NVIDIA GPU drivers.  
+   Simply press **Enter** to confirm.
+   :::
+3. Once you see the message below, the installation has completed successfully:
+
+   ```shell
+   Installation completed successfully!
+   ```
+
+You can now remove the USB drive and press **Ctrl + Alt + Del** to restart.
+
+## Verify installation
+
+After rebooting, the system will enter Ubuntu.
+
+1. Log in using the default credentials:
+
+    * **Username**: `olares`
+    * **Password**: `olares`
+
+2. Run the following command to verify the installation:
+
+   ```bash
+   sudo olares-check
+   ```
+
+   If the output shows the following, Olares has been installed successfully:
+
+   ```bash
+   check list ---------
+   check Olaresd: success
+   check Containerd: success
+   ```
+
+<!--@include: ./install-and-activate-olares.md-->
+
+<!--@include: ./log-in-to-olares.md-->
+
+<!--@include: ./reusables.md#protect-olares-id-->
+
+<!--@include: ./reusables.md#installation-troubleshooting-tip-->

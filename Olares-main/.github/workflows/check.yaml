@@ -1,0 +1,306 @@
+name: Lint and Test Charts
+
+on:
+  push:
+    branches: [ "main", "release-*" ]
+    paths:
+      - '!docs/**'    
+      - 'apps/.olares/**'
+      - 'build/**'
+      - 'cli/**'
+      - 'daemon/**'
+      - 'framework/**/.olares/**'
+      - 'infrastructure/**/.olares/**'
+      - 'platform/**/.olares/**'
+      - 'vendor/**'
+  pull_request:
+    branches: [ "main", "release-*" ]
+    paths:
+      - '!docs/**'    
+      - 'apps/.olares/**'
+      - 'build/**'
+      - 'cli/**'
+      - 'daemon/**'
+      - 'framework/**/.olares/**'
+      - 'infrastructure/**/.olares/**'
+      - 'platform/**/.olares/**'
+      - 'vendor/**'
+
+  workflow_dispatch:
+
+
+jobs:
+  check-permission:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["MEMBER","OWNER"]'), github.event.pull_request.author_association)
+    steps:
+      - run: echo "author association check passed"
+
+  lint-test:
+    needs: check-permission
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.12.1
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          check-latest: true
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.6.0
+      
+      - name: Pre package
+        run: |
+          bash build/package.sh
+
+      - name: Run chart-testing (lint)
+        run: ct lint --chart-dirs .dist/wizard/config,.dist/wizard/config/apps,.dist/wizard/config/gpu --check-version-increment=false --all --validate-maintainers=false
+
+  test-version:
+    needs: check-permission
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.generate.outputs.version }}
+    steps:
+      - id: generate
+        run: |
+          v=1.12.8-$(echo $RANDOM$RANDOM)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  upload-cli:
+    needs: test-version
+    uses: ./.github/workflows/release-cli.yaml
+    secrets: inherit
+    with:
+      version: ${{ needs.test-version.outputs.version }}
+      ref: ${{ github.event.pull_request.head.ref }}
+      repository: ${{ github.event.pull_request.head.repo.full_name }}
+      publish-npm: false
+
+  upload-daemon:
+    needs: test-version
+    uses: ./.github/workflows/release-daemon.yaml
+    secrets: inherit
+    with:
+      version: ${{ needs.test-version.outputs.version }}
+      ref: ${{ github.event.pull_request.head.ref }}
+      repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+  push-image:
+    needs: check-permission
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+      # test
+      - run: |
+          bash build/image-manifest.sh && bash build/upload-images.sh .manifest/images.mf
+
+  push-image-arm64:
+    needs: check-permission
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: Install skopeo (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          
+
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      - run: |
+          export PATH=$PATH:/usr/local/bin:/home/ubuntu/.local/bin
+          bash build/image-manifest.sh && bash build/upload-images.sh .manifest/images.mf linux/arm64
+
+
+  push-deps:
+    needs: [test-version, upload-daemon]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+      # test
+      - env:
+          VERSION: ${{ needs.test-version.outputs.version }}
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          bash build/deps-manifest.sh && bash build/upload-deps.sh
+
+  push-deps-arm64:
+    needs: [test-version, upload-daemon]
+    runs-on: [self-hosted, linux, ARM64]
+
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Install coscmd
+        run: pip install coscmd        
+
+      - name: Configure coscmd
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          COS_BUCKET: ${{ secrets.COS_BUCKET }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          END_POINT: ${{ secrets.END_POINT }}
+        run: |
+          coscmd config -a $TENCENT_SECRET_ID \
+                        -s $TENCENT_SECRET_KEY \
+                        -b $COS_BUCKET \
+                        -r $COS_REGION 
+
+      # test
+      - env:
+          VERSION: ${{ needs.test-version.outputs.version }}
+          REPO_PATH: '${{ secrets.REPO_PATH }}'
+        run: |
+          export PATH=$PATH:/usr/local/bin:/home/ubuntu/.local/bin
+          bash build/deps-manifest.sh linux/arm64 && bash build/upload-deps.sh linux/arm64
+
+
+  upload-package:
+    needs: [lint-test, test-version, push-image, push-image-arm64, push-deps, push-deps-arm64]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.ref }}
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+    - name: Package installer
+      run: |
+        bash build/build.sh ${{ needs.test-version.outputs.version }}
+
+    - name: Install coscmd
+      run: pip install coscmd        
+
+    - name: Configure coscmd
+      env:
+        TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+        TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+        COS_BUCKET: ${{ secrets.COS_BUCKET }}
+        COS_REGION: ${{ secrets.COS_REGION }}
+        END_POINT: ${{ secrets.END_POINT }}
+      run: |
+        coscmd config -a $TENCENT_SECRET_ID \
+                      -s $TENCENT_SECRET_KEY \
+                      -b $COS_BUCKET \
+                      -r $COS_REGION 
+
+
+    - name: Upload package
+      run: |
+        md5sum install-wizard-v${{ needs.test-version.outputs.version }}.tar.gz > install-wizard-v${{ needs.test-version.outputs.version }}.md5sum.txt && \
+        coscmd upload install-wizard-v${{ needs.test-version.outputs.version }}.md5sum.txt /install-wizard-v${{ needs.test-version.outputs.version }}.md5sum.txt && \
+        coscmd upload install-wizard-v${{ needs.test-version.outputs.version }}.tar.gz /install-wizard-v${{ needs.test-version.outputs.version }}.tar.gz
+
+
+  install-test:
+    needs: [test-version, upload-cli, upload-package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Request
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: 'https://api.test.olares.com/space/v1/resource/installTest'
+          method: 'POST'
+          customHeaders: '{"Authorization": "${{ secrets.INSTALL_SECRET }}"}'
+          data: 'versions=${{ needs.test-version.outputs.version }}&downloadUrl=https://cdn.olares.com/install-wizard-v${{ needs.test-version.outputs.version }}.tar.gz'
+          contentType: "application/x-www-form-urlencoded"
+
+      - name: Check Result
+        uses: eball/poll-check-endpoint@v0.1.0
+        with:
+          url: https://api.test.olares.com/space/v1/resource/installResult
+          method: 'POST'
+          expectStatus: 200
+          failedBodyRegex: '"installedAt":"[0-9]{10,}".*"isSuccess":false'
+          expectBodyRegex: '"isSuccess":true'
+          timeout: 1800000
+          interval: 30000
+          customHeaders: '{"Authorization": "${{ secrets.INSTALL_SECRET }}", "Content-Type": "application/x-www-form-urlencoded"}'
+          data: 'versions=${{ needs.test-version.outputs.version }}'
