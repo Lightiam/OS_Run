@@ -248,3 +248,31 @@ class Credentials(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedReads(unittest.TestCase):
+    """A body larger than the bound must raise, not return half a document."""
+
+    class Fake:
+        def __init__(self, payload):
+            self.payload = payload
+            self.read_calls = []
+
+        def read(self, n):
+            self.read_calls.append(n)
+            return self.payload[:n]
+
+    def test_a_body_within_the_bound_is_returned(self):
+        body = send.read_bounded(self.Fake(b'{"ok":true}'), limit=1024)
+        self.assertEqual(json.loads(body), {"ok": True})
+
+    def test_a_body_over_the_bound_raises_rather_than_truncating(self):
+        oversized = b"x" * 2048
+        with self.assertRaises(ValueError) as caught:
+            send.read_bounded(self.Fake(oversized), limit=1024)
+        self.assertIn("not read in full", str(caught.exception))
+
+    def test_the_source_bound_is_larger_than_the_destination_bound(self):
+        # A destination reply is a small status object; a source reply is a
+        # batch of measurements, which legitimately runs to megabytes.
+        self.assertGreater(send.MAX_SOURCE_BYTES, send.MAX_RESPONSE_BYTES)

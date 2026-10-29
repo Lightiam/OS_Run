@@ -45,7 +45,8 @@ DEFAULT_INTERVAL = 60.0
 MIN_INTERVAL = 10.0
 CONNECT_TIMEOUT = 15
 POST_TIMEOUT = 30
-MAX_RESPONSE_BYTES = 64 * 1024
+MAX_RESPONSE_BYTES = 64 * 1024          # a destination reply is a small status object
+MAX_SOURCE_BYTES = 8 * 1024 * 1024      # a source reply is a batch of measurements
 CONFIRMING = ("accepted", "duplicate")
 LOOPBACK = ("localhost", "127.0.0.1", "::1", "[::1]")
 
@@ -81,10 +82,19 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirects)
 
 
-def read_bounded(response):
-    body = response.read(MAX_RESPONSE_BYTES + 1)
-    if len(body) > MAX_RESPONSE_BYTES:
-        body = body[:MAX_RESPONSE_BYTES]
+def read_bounded(response, limit=MAX_RESPONSE_BYTES):
+    """Read at most `limit` bytes, and refuse to return a truncated body.
+
+    Silently truncating would hand half a JSON document to the parser, which
+    fails somewhere unrelated and looks like malformed data rather than a body
+    that was too big.
+    """
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(
+            f"the response exceeded {limit} bytes, so it was not read in full. "
+            "Lower --limit, or raise the bound if this is genuinely expected."
+        )
     return body.decode("utf-8", "replace")
 
 
@@ -104,7 +114,7 @@ def is_loopback(url):
 
 def get_json(url, timeout=CONNECT_TIMEOUT):
     with OPENER.open(urllib.request.Request(url), timeout=timeout) as response:
-        return json.loads(read_bounded(response))
+        return json.loads(read_bounded(response, MAX_SOURCE_BYTES))
 
 
 def resolve_environment(source, wanted):
