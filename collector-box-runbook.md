@@ -1,13 +1,14 @@
 # Collector box: hardware spec and Ubuntu setup
 
 Target: a small always-on Linux machine that reads host metrics and pushes them
-outbound over HTTPS to the LightOS app. Outbound only — no inbound ports, no
+outbound over HTTPS to the app. Outbound only — no inbound ports, no
 public IP, no port forwarding.
 
-> **Status:** all three pieces now exist. The agent is `tools/lightcollect/` in
-> the LightOS repo; the endpoint is the `collector-ingest` edge function plus
-> the `20261028000000_collector_ingest.sql` migration in `agenticlightossh`;
-> and keys are minted from **Infrastructure** in that app's dashboard
+> **Status:** all three pieces now exist. The agent is
+> `collector/lightcollect/`; the endpoint is the `collector-ingest` edge
+> function plus the `20261028000000_collector_ingest.sql` migration, both
+> under `collector/server/`; and keys are minted from **Infrastructure**
+> in the app's dashboard
 > (`/dashboard/infrastructure`). Nothing is deployed yet: push the migration
 > and `supabase functions deploy collector-ingest` first, or the page will have
 > no tables to read. If you would rather not run the app, the same key comes
@@ -135,7 +136,7 @@ page copies for you — not the app's own domain.
 The agent is a single standard-library file, so there is nothing to build and no
 `pip install`. Ubuntu 24.04 already ships `python3`.
 
-Copy `tools/lightcollect/lightcollect.py` from the LightOS repo to the box, then:
+Copy `collector/lightcollect/lightcollect.py` from this repo to the box, then:
 
 ```bash
 sudo install -m 0755 lightcollect.py /usr/local/bin/lightos-collector
@@ -167,7 +168,7 @@ Save as `/etc/systemd/system/lightos-collector.service`:
 
 ```ini
 [Unit]
-Description=LightOS metrics collector
+Description=Host metrics collector
 After=network-online.target
 Wants=network-online.target
 

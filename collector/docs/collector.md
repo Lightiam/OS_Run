@@ -10,7 +10,7 @@ design: it works from behind a home or office router.
 
 | Piece | Where |
 |---|---|
-| Agent | `tools/lightcollect/` in the LightOS repo (Python, standard library only) |
+| Agent | `collector/lightcollect/` (Python, standard library only) |
 | Endpoint | `supabase/functions/collector-ingest/` + `supabase/functions/_shared/collector-ingest-core.ts` |
 | Schema | `supabase/migrations/20261028000000_collector_ingest.sql` |
 | UI | `src/pages/Infrastructure.tsx`, `/dashboard/infrastructure` |

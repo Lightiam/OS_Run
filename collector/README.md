@@ -1,6 +1,6 @@
 # Collector
 
-The LightOS host-metrics collector, kept here as its own subsystem because it
+The host-metrics collector, kept here as its own subsystem because it
 is separate from the app. An agent on a Linux box reads its own host state and
 POSTs it outbound over HTTPS. The box needs no inbound port, no public address
 and no port forwarding.

@@ -1,8 +1,8 @@
 # OS_Run
 
-Working folder for the LightOS host-metrics collector: a small always-on Linux
+Working folder for the host-metrics collector: a small always-on Linux
 box that reads its own host state and pushes it outbound over HTTPS to the
-LightOS app. No inbound ports, no public IP, no port forwarding.
+the app. No inbound ports, no public IP, no port forwarding.
 
 ## What is here
 

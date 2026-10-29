@@ -1,15 +1,11 @@
-# LightCollect
+# Collector agent
 
-LightCollect is the outbound host-metrics collector for LightOS. It reads host
-state from `/proc`, batches measurements as newline-delimited JSON, and POSTs
-them to the LightOS app.
+The outbound host-metrics collector. It reads host state from `/proc`,
+batches measurements as newline-delimited JSON, and POSTs them to the app.
 
 Every connection is outbound, so a collector host needs no inbound port, no
 public address, and no port forwarding. It is standard library only: a stock
 Ubuntu host runs it with no `pip install` step.
-
-Do not confuse it with `fabric-os/lightos-fabric-alpha/collector/lightos_collector.py`,
-which is the opposite thing — an *inbound* JSONL receiver used for local tests.
 
 ## Usage
 
@@ -42,8 +38,8 @@ stays out of `ps` output.
 | — | `--root` | `/` (point at a fixture tree to test) |
 | — | `--settle` | `1.0` seconds |
 
-The endpoint is the `collector-ingest` Supabase edge function in
-`agenticlightossh`, so `LIGHTOS_URL` is the project's functions host:
+The endpoint is the `collector-ingest` Supabase edge function, so
+`LIGHTOS_URL` is the project's functions host:
 
 ```bash
 LIGHTOS_URL=https://<project-ref>.supabase.co
