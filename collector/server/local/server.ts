@@ -152,6 +152,18 @@ const server = createServer(async (req, res) => {
   const path = url.pathname.replace(/\/+$/, "") || "/";
 
   try {
+    // The browser preflights the JSON POSTs from the app. The ingest path does
+    // its own CORS inside the shared core, so it is left alone here.
+    if (req.method === "OPTIONS" && path !== INGEST_PATH) {
+      res.writeHead(204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Max-Age": "86400",
+      });
+      return res.end();
+    }
+
     if (path === INGEST_PATH) {
       const body = await readBody(req);
       const response = await handleIngest(toWebRequest(req, body), ingestDeps);

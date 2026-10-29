@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { collectorApi, type CollectorEnvironment, type CollectorMeasurement, type MintedEnvironment } from "@/lib/collector/client";
+import { collectorApi, localApi, LOCAL_BASE, type CollectorEnvironment, type CollectorMeasurement, type MintedEnvironment } from "@/lib/collector/client";
 import { formatBytes, formatPercent, formatUptime, health, relativeTime, summarize, type Health } from "@/lib/collector/format";
 
 const HEALTH_STYLE: Record<Health, { label: string; icon: typeof CheckCircle2; className: string }> = {
@@ -22,7 +22,20 @@ const HEALTH_STYLE: Record<Health, { label: string; icon: typeof CheckCircle2; c
   revoked: { label: "Revoked", icon: XCircle, className: "text-muted-foreground border-border" },
 };
 
-const INGEST_HOST = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "";
+/**
+ * Where an agent posts. Against the local server that is the local server
+ * itself; otherwise the Supabase project host, which is not the app's own
+ * domain and is the thing people most often get wrong.
+ */
+const INGEST_HOST =
+  LOCAL_BASE || ((import.meta.env.VITE_SUPABASE_URL as string | undefined)?.replace(/\/+$/, "") ?? "");
+
+/**
+ * The local server when VITE_COLLECTOR_LOCAL_URL is set, Supabase otherwise.
+ * Chosen here rather than inside the client, so the client stays the thing
+ * its own test suite describes.
+ */
+const api = LOCAL_BASE ? localApi : collectorApi;
 
 function copy(text: string, what: string) {
   navigator.clipboard.writeText(text).then(
@@ -43,7 +56,7 @@ export default function Infrastructure() {
 
   const refresh = useCallback(async () => {
     try {
-      setEnvironments(await collectorApi.list());
+      setEnvironments(await api.list());
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
@@ -52,6 +65,12 @@ export default function Infrastructure() {
   }, []);
 
   useEffect(() => {
+    // The local server has no accounts, so there is no session to wait for.
+    if (LOCAL_BASE) {
+      setSignedIn(true);
+      refresh();
+      return;
+    }
     supabase.auth.getSession().then(({ data }) => {
       const ok = !!data.session;
       setSignedIn(ok);
@@ -63,7 +82,7 @@ export default function Infrastructure() {
   const create = async () => {
     setCreating(true);
     try {
-      const environment = await collectorApi.create(name);
+      const environment = await api.create(name);
       setMinted(environment);
       setName("");
       await refresh();
@@ -78,7 +97,7 @@ export default function Infrastructure() {
     if (!confirm(`Revoke the key for "${env.name}"? Its collector will start failing immediately, and spooling rather than losing what it collects.`)) return;
     setBusy(env.id);
     try {
-      await collectorApi.revoke(env.id);
+      await api.revoke(env.id);
       toast.success("Key revoked");
       await refresh();
     } catch (e) {
@@ -283,7 +302,7 @@ function MetricsSheet({ environment, onClose }: { environment: CollectorEnvironm
   useEffect(() => {
     if (!environment) { setRows(null); setError(null); return; }
     let live = true;
-    collectorApi.measurements(environment.id).then(
+    api.measurements(environment.id).then(
       (r) => { if (live) setRows(r); },
       (e) => { if (live) setError((e as Error).message); },
     );

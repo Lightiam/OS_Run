@@ -1,16 +1,29 @@
 diff --git a/src/App.tsx b/src/App.tsx
-index 8cdcb97..b0d8edd 100644
+index 8cdcb97..d5e4fe0 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -51,6 +51,7 @@ import OAuthConsent from "./pages/OAuthConsent";
+@@ -51,6 +51,8 @@ import OAuthConsent from "./pages/OAuthConsent";
  import MtmcConsole from "./pages/MtmcConsole";
  import GatewaySetup from "./pages/GatewaySetup";
  import ComputeProviders from "./pages/ComputeProviders";
 +import Infrastructure from "./pages/Infrastructure";
++import { LOCAL_BASE } from "./lib/collector/client";
  
  const queryClient = new QueryClient();
  
-@@ -116,6 +117,7 @@ const App = () => (
+@@ -85,6 +87,11 @@ const App = () => (
+           </Route>
+           <Route path="/examples" element={<Examples />} />
+ 
++          {/* Only when VITE_COLLECTOR_LOCAL_URL is set: the collector page
++              outside the dashboard, which requires a session the local server
++              has no way to issue. Absent from every deployed build. */}
++          {LOCAL_BASE && <Route path="/local/infrastructure" element={<Infrastructure />} />}
++
+           {/* Dashboard Routes */}
+           <Route path="/dashboard" element={<DashboardLayout />}>
+             <Route index element={<Dashboard />} />
+@@ -116,6 +123,7 @@ const App = () => (
              <Route path="accelerator" element={<AcceleratorRuntime />} />
              <Route path="gateway-setup" element={<GatewaySetup />} />
              <Route path="providers" element={<ComputeProviders />} />

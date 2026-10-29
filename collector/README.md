@@ -70,6 +70,28 @@ What this is not: there is no auth, so every environment belongs to one
 stand-in user. It is for proving the wire contract and developing the agent,
 not for holding real data.
 
+### Pointing the app at it
+
+Set this in the app repo, in `.env.local`, which is gitignored:
+
+```
+VITE_COLLECTOR_LOCAL_URL=http://localhost:8787
+```
+
+Restart the dev server, because Vite reads env files only at startup. The
+Infrastructure page then talks to the local server, and the key dialog hands
+out `LIGHTOS_URL=http://localhost:8787` rather than the Supabase host.
+
+The route is `/local/infrastructure`, outside the dashboard layout, because
+that layout requires a session the local server has no way to issue. It only
+exists while the variable is set, so it is absent from every deployed build.
+
+One trap worth knowing: vitest loads `.env.local` too. Resolving the transport
+inside `client.ts` therefore pointed the mocked-Supabase suite at the real
+local server, and 17 tests failed by passing against live data. The choice is
+made at the call site in `Infrastructure.tsx` instead, so `collectorApi` stays
+the thing its own tests describe.
+
 ### Running the agent where there is no /proc
 
 The agent reads `/proc`, so on Windows or macOS point it at a fixture tree

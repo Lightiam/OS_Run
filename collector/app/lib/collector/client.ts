@@ -76,12 +76,65 @@ export type CollectorApi = {
 };
 
 /**
+ * Set `VITE_COLLECTOR_LOCAL_URL` to talk to `collector/server/local` instead of
+ * Supabase. That server speaks the same ingest contract but stores to SQLite,
+ * so the page works with nothing deployed and nobody signed in. Left unset,
+ * which is every deployed build, none of the Supabase path below changes.
+ */
+export const LOCAL_BASE =
+  (import.meta.env.VITE_COLLECTOR_LOCAL_URL as string | undefined)?.replace(/\/+$/, "") || "";
+
+async function localJson<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${LOCAL_BASE}${path}`, {
+      ...init,
+      headers: init?.body ? { "Content-Type": "application/json" } : undefined,
+    });
+  } catch {
+    // A dead local server is the overwhelmingly likely cause, and the browser
+    // reports it only as a generic network failure, so say which one.
+    throw new Error(`Could not reach the local collector server at ${LOCAL_BASE}. Is it running?`);
+  }
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(body?.error || `The local server returned ${response.status}.`);
+  return body as T;
+}
+
+/** The same contract as the Supabase transport, against the local server. */
+export const localApi: CollectorApi = {
+  list: () => localJson<CollectorEnvironment[]>("/api/environments"),
+
+  async create(name) {
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Give the environment a name.");
+    const minted = await localJson<MintedEnvironment>("/api/environments", {
+      method: "POST",
+      body: JSON.stringify({ name: trimmed }),
+    });
+    if (!minted?.key) {
+      throw new Error("The environment was created but no key came back. Reload and try again.");
+    }
+    return minted;
+  },
+
+  async revoke(id) {
+    await localJson(`/api/environments/${encodeURIComponent(id)}/revoke`, { method: "POST" });
+  },
+
+  measurements: (environmentId, limit = 20) =>
+    localJson<CollectorMeasurement[]>(
+      `/api/measurements?environment=${encodeURIComponent(environmentId)}&limit=${limit}`,
+    ),
+};
+
+/**
  * Collector environments are read straight from Postgres: row-level security
  * scopes every select to the signed-in user, and minting and revoking are
  * `security definer` functions, so there is no edge function to deploy and no
  * place for the browser to write either table directly.
  */
-export const collectorApi: CollectorApi = {
+const supabaseApi: CollectorApi = {
   async list() {
     const { data, error } = await supabase
       .from("collector_environments")
@@ -120,6 +173,13 @@ export const collectorApi: CollectorApi = {
     return (data ?? []) as CollectorMeasurement[];
   },
 };
+
+/**
+ * The Supabase transport, always. Which one a page actually uses is decided at
+ * the call site, because vitest loads `.env.local` too: resolving it here would
+ * silently point this suite at a developer's local server instead of the mocks.
+ */
+export const collectorApi: CollectorApi = supabaseApi;
 
 /** Exported for the test that keeps the select in step with the column grant. */
 export const COLUMNS = { environment: ENVIRONMENT_COLUMNS, measurement: MEASUREMENT_COLUMNS };

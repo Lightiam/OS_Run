@@ -32,7 +32,7 @@ vi.mock("@/integrations/supabase/client", () => ({
   },
 }));
 
-import { COLUMNS, collectorApi } from "@/lib/collector/client";
+import { COLUMNS, collectorApi, localApi } from "@/lib/collector/client";
 
 const lastQuery = () => queries[queries.length - 1];
 const callsOf = (query: Query) => query.calls.map(([method, args]) => [method, ...args]);
@@ -195,5 +195,61 @@ describe("reading measurements", () => {
   it("surfaces a failure", async () => {
     result = { data: null, error: { code: "PGRST301", message: "JWT expired" } };
     await expect(collectorApi.measurements("e1")).rejects.toThrow("Your session has expired. Please sign in again.");
+  });
+});
+
+describe("the local transport", () => {
+  const calls: Array<[string, RequestInit | undefined]> = [];
+  let reply: { ok: boolean; status: number; body: unknown } | Error;
+
+  beforeEach(() => {
+    calls.length = 0;
+    reply = { ok: true, status: 200, body: [] };
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) => {
+      calls.push([String(url), init]);
+      if (reply instanceof Error) return Promise.reject(reply);
+      const { ok, status, body } = reply;
+      return Promise.resolve({ ok, status, json: () => Promise.resolve(body) } as Response);
+    });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("lists over HTTP rather than through Postgres", async () => {
+    reply = { ok: true, status: 200, body: [{ id: "e1", name: "box" }] };
+    const rows = await localApi.list();
+    expect(rows).toEqual([{ id: "e1", name: "box" }]);
+    expect(calls[0][0]).toContain("/api/environments");
+  });
+
+  it("posts the name as JSON and hands back the minted key", async () => {
+    reply = { ok: true, status: 201, body: { id: "e1", name: "box", key: "lfc_abc", key_prefix: "lfc_abc" } };
+    const minted = await localApi.create("  box  ");
+    expect(minted.key).toBe("lfc_abc");
+    const [url, init] = calls[0];
+    expect(url).toContain("/api/environments");
+    expect(init?.method).toBe("POST");
+    // Trimmed, so a stray space does not become part of the name.
+    expect(JSON.parse(String(init?.body))).toEqual({ name: "box" });
+  });
+
+  it("refuses a blank name without troubling the server", async () => {
+    await expect(localApi.create("   ")).rejects.toThrow("Give the environment a name.");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("says the server is unreachable rather than passing on a bare network error", async () => {
+    reply = new TypeError("Failed to fetch");
+    await expect(localApi.list()).rejects.toThrow(/Could not reach the local collector server/);
+  });
+
+  it("surfaces what the server said about a refusal", async () => {
+    reply = { ok: false, status: 400, body: { error: "You already have an environment with that name." } };
+    await expect(localApi.create("box")).rejects.toThrow("You already have an environment with that name.");
+  });
+
+  it("still says something when a failure carries no message", async () => {
+    reply = { ok: false, status: 500, body: null };
+    await expect(localApi.list()).rejects.toThrow("The local server returned 500.");
   });
 });
