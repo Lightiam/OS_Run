@@ -1,33 +1,63 @@
-"""Turn collector measurements into Infrastructure snapshots.
+"""Map collector measurements onto the Infrastructure snapshot contract.
 
-Pure functions, no I/O, so the mapping can be tested without a server.
+Pure functions, no I/O, so the mapping is testable without a server.
 
-The envelope -- version, platform, batch_id, observed_at, entities, errors --
-is the contract this was written against. It could not be verified against any
-code available here, so if the receiving end disagrees, change it HERE: nothing
-else in the sender knows the shape.
+The receiver rejects unknown fields, so nothing here forwards arbitrary source
+properties: every key in the output is one the contract names.
 
-Three rules the mapping holds to deliberately:
+Three conversions are easy to get wrong and are therefore spelled out:
 
-  * Host identity lives in the entity, never in a metric name. Encoding it as
-    "host.<name>.cpu.utilization" makes every metric name unique per machine,
-    which breaks aggregation across a fleet and cannot be undone later.
-  * Units are explicit, because the sources disagree. cpu.utilization is a 0..1
-    ratio while used_percent is 0..100, and treating them alike is how 23%
-    silently becomes 0%.
-  * An unavailable reading is omitted, never sent as zero. The agent reports
-    null when a counter did not move; a zero would be a measurement that was
-    never taken.
+  * cpu.utilization is a 0..1 ratio at the source and cpu_pct is a percent at
+    the destination. 0.2308 becomes 23.08. A ratio outside 0..1 is not a ratio
+    and is dropped rather than clamped.
+  * Only the root mount "/" is mapped. Summing mounts double-counts, because
+    bind mounts and overlays report the same bytes more than once.
+  * observed_at carries the newest real collection time, never wall-clock now.
+    Refreshing it would make stale data look live, which is the one thing the
+    receiver's 24 hour window exists to catch.
 """
+import json
+from datetime import datetime, timedelta, timezone
 
-SNAPSHOT_VERSION = "1"
+VERSION = 1
 PLATFORM = "linux"
+KIND = "node"
+STATE = "observed"
 
-RATIO = "ratio"
-PERCENT = "percent"
-BYTES = "bytes"
-SECONDS = "seconds"
-COUNT = "count"
+MAX_ENTITIES = 1000
+MAX_ERRORS = 20
+MAX_ERROR_CHARS = 240
+MAX_BYTES = 1024 * 1024
+MAX_IDENTITY = 256
+
+STALE_AFTER = timedelta(hours=24)
+MAX_FUTURE_SKEW = timedelta(minutes=5)
+
+METRIC_FIELDS = (
+    "cpu_pct",
+    "memory_used_bytes",
+    "memory_total_bytes",
+    "disk_used_bytes",
+    "disk_total_bytes",
+)
+
+
+def parse_time(value):
+    """A timezone-aware datetime, or None. Naive input is rejected, not assumed UTC."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def iso(moment):
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _number(value):
@@ -39,6 +69,11 @@ def _number(value):
     return value
 
 
+def _non_negative(value):
+    number = _number(value)
+    return None if number is None or number < 0 else number
+
+
 def _mapping(value):
     return value if isinstance(value, dict) else {}
 
@@ -47,114 +82,174 @@ def _sequence(value):
     return value if isinstance(value, list) else []
 
 
-def _reading(name, value, unit):
-    """One reading, or None when the value is unusable."""
-    number = _number(value)
-    return None if number is None else {"name": name, "value": number, "unit": unit}
+def cpu_percent(utilization):
+    """0..1 ratio to percent. Anything outside that range is not a ratio."""
+    ratio = _number(utilization)
+    if ratio is None or ratio < 0 or ratio > 1:
+        return None
+    return round(ratio * 100, 2)
 
 
-def readings(metrics):
-    """Flatten one measurement's metrics, dropping everything unavailable.
-
-    Names carry no host component: identity belongs to the entity.
-    """
-    metrics = _mapping(metrics)
-    out = []
-
-    def add(name, value, unit):
-        reading = _reading(name, value, unit)
-        if reading is not None:
-            out.append(reading)
-
-    add("cpu.utilization", _mapping(metrics.get("cpu")).get("utilization"), RATIO)
-
-    memory = _mapping(metrics.get("memory"))
-    add("memory.total", memory.get("total_bytes"), BYTES)
-    add("memory.available", memory.get("available_bytes"), BYTES)
-    add("memory.used", memory.get("used_bytes"), BYTES)
-    add("memory.used_percent", memory.get("used_percent"), PERCENT)
-
-    load = _mapping(metrics.get("load"))
-    for window in ("load1", "load5", "load15"):
-        add(f"load.{window}", load.get(window), COUNT)
-
-    add("uptime", metrics.get("uptime_seconds"), SECONDS)
-
-    for disk in _sequence(metrics.get("disk")):
+def root_disk(disks):
+    """The entry for "/", or None. Mounts are never summed."""
+    for disk in _sequence(disks):
         disk = _mapping(disk)
-        mount = disk.get("mount")
-        if not isinstance(mount, str) or not mount:
-            continue
-        add(f"disk.{mount}.total", disk.get("total_bytes"), BYTES)
-        add(f"disk.{mount}.used", disk.get("used_bytes"), BYTES)
-        add(f"disk.{mount}.free", disk.get("free_bytes"), BYTES)
-        add(f"disk.{mount}.used_percent", disk.get("used_percent"), PERCENT)
+        if disk.get("mount") == "/":
+            return disk
+    return None
 
-    for interface in _sequence(metrics.get("network")):
-        interface = _mapping(interface)
-        name = interface.get("interface")
-        if not isinstance(name, str) or not name:
-            continue
-        add(f"network.{name}.rx", interface.get("rx_bytes"), BYTES)
-        add(f"network.{name}.tx", interface.get("tx_bytes"), BYTES)
+
+def metrics_for(source):
+    """Only the five contract metrics, each omitted when unusable."""
+    source = _mapping(source)
+    out = {}
+
+    percent = cpu_percent(_mapping(source.get("cpu")).get("utilization"))
+    if percent is not None:
+        out["cpu_pct"] = percent
+
+    memory = _mapping(source.get("memory"))
+    for key, field in (("used_bytes", "memory_used_bytes"), ("total_bytes", "memory_total_bytes")):
+        value = _non_negative(memory.get(key))
+        if value is not None:
+            out[field] = value
+
+    disk = root_disk(source.get("disk"))
+    if disk is not None:
+        for key, field in (("used_bytes", "disk_used_bytes"), ("total_bytes", "disk_total_bytes")):
+            value = _non_negative(disk.get(key))
+            if value is not None:
+                out[field] = value
 
     return out
 
 
-def entity(measurement):
-    """One host entity, or None when the measurement cannot identify a host.
-
-    A measurement with no hostname is dropped rather than guessed at: an
-    unattributable reading is worse than a missing one.
-    """
-    measurement = _mapping(measurement)
-    host = _mapping(measurement.get("host"))
+def identity_of(measurement):
+    """The hostname, or None. Identity never comes from a metric name."""
+    host = _mapping(_mapping(measurement).get("host"))
     hostname = host.get("hostname")
-    if not isinstance(hostname, str) or not hostname.strip():
+    if not isinstance(hostname, str):
         return None
-
-    identity = {"hostname": hostname.strip()}
-    for field in ("os", "kernel", "arch"):
-        value = host.get(field)
-        if isinstance(value, str) and value.strip():
-            identity[field] = value.strip()
-
-    return {
-        "kind": "host",
-        "identity": identity,
-        "observed_at": measurement.get("collected_at"),
-        "readings": readings(measurement.get("metrics")),
-    }
+    hostname = hostname.strip()
+    if not hostname or len(hostname) > MAX_IDENTITY:
+        return None
+    return hostname
 
 
-def snapshot(measurements, batch_id, observed_at, platform=PLATFORM, errors=None):
-    """The envelope for a batch of measurements.
+def latest_per_host(measurements):
+    """Newest measurement per hostname, plus a count of what was unusable.
 
-    Measurements that cannot be attributed to a host are counted in `errors`
-    rather than dropped silently, so the receiving end can see that something
-    was collected and discarded.
+    The source returns newest first, but this does not rely on that: it compares
+    timestamps, so a change in source ordering cannot silently pick an old row.
     """
-    entities = []
-    unattributed = 0
+    best = {}
+    skipped_no_host = 0
+    skipped_no_time = 0
+
     for measurement in measurements:
-        built = entity(measurement)
-        if built is None:
-            unattributed += 1
-        else:
-            entities.append(built)
+        hostname = identity_of(measurement)
+        if hostname is None:
+            skipped_no_host += 1
+            continue
+        collected = parse_time(_mapping(measurement).get("collected_at"))
+        if collected is None:
+            skipped_no_time += 1
+            continue
+        current = best.get(hostname)
+        if current is None or collected > current[0]:
+            best[hostname] = (collected, measurement)
 
-    reported = list(errors or [])
-    if unattributed:
-        reported.append({
-            "code": "unattributed_measurement",
-            "message": f"{unattributed} measurement(s) carried no hostname and were not sent.",
-        })
+    return best, skipped_no_host, skipped_no_time
 
+
+def build_entity(hostname, measurement):
+    """One entity, or None when it carries no usable metric at all."""
+    metrics = metrics_for(_mapping(measurement).get("metrics"))
+    if not metrics:
+        return None
     return {
-        "version": SNAPSHOT_VERSION,
-        "platform": platform,
-        "batch_id": batch_id,
-        "observed_at": observed_at,
-        "entities": entities,
-        "errors": reported,
+        "id": hostname,
+        "name": hostname,
+        "kind": KIND,
+        "state": STATE,
+        "metrics": metrics,
     }
+
+
+def _clip(messages):
+    out = []
+    for message in messages[:MAX_ERRORS]:
+        text = str(message)
+        out.append(text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 1] + "…")
+    return out
+
+
+def build(measurements, batch_id, now=None):
+    """Return (snapshot, report).
+
+    `report` is for the operator, not the wire: it carries the newest source
+    time, whether that is stale or in the future, and anything dropped. The
+    caller decides what to do about it; this function never lies about time to
+    make a batch acceptable.
+    """
+    now = now or datetime.now(timezone.utc)
+    best, no_host, no_time = latest_per_host(measurements)
+
+    entities = []
+    newest = None
+    without_metrics = 0
+
+    for hostname in sorted(best):
+        collected, measurement = best[hostname]
+        entity = build_entity(hostname, measurement)
+        if entity is None:
+            without_metrics += 1
+            continue
+        entities.append(entity)
+        if newest is None or collected > newest:
+            newest = collected
+
+    problems = []
+    if no_host:
+        problems.append(f"{no_host} measurement(s) had no usable hostname and were not sent.")
+    if no_time:
+        problems.append(f"{no_time} measurement(s) had no usable collected_at and were not sent.")
+    if without_metrics:
+        problems.append(f"{without_metrics} host(s) had no usable metric and were not sent.")
+
+    truncated = False
+    if len(entities) > MAX_ENTITIES:
+        truncated = True
+        problems.append(
+            f"{len(entities) - MAX_ENTITIES} entities over the {MAX_ENTITIES} limit were not sent."
+        )
+        entities = entities[:MAX_ENTITIES]
+
+    observed = newest or now
+    stale = newest is not None and (now - newest) > STALE_AFTER
+    future = newest is not None and (newest - now) > MAX_FUTURE_SKEW
+
+    snapshot = {
+        "version": VERSION,
+        "platform": PLATFORM,
+        "batch_id": batch_id,
+        "observed_at": iso(observed),
+        "entities": entities,
+        "errors": _clip(problems),
+    }
+
+    size = len(json.dumps(snapshot).encode("utf-8"))
+    oversized = size > MAX_BYTES
+
+    report = {
+        "entities": len(entities),
+        "newest_source_time": iso(newest) if newest else None,
+        "age_seconds": None if newest is None else (now - newest).total_seconds(),
+        "stale": stale,
+        "future": future,
+        "truncated": truncated,
+        "bytes": size,
+        "oversized": oversized,
+        "problems": problems,
+    }
+    return snapshot, report
