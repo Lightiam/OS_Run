@@ -38,6 +38,51 @@ is the source of truth for both; nothing in it depends on the app repo.
 without it `.from("collector_environments")` does not typecheck, because the
 generated types file predates these tables.
 
+## Running it locally
+
+A working ingest server with no deployment, no Docker and no `npm install` —
+it uses `node:sqlite` and Node 24 TypeScript stripping, both built in. It
+imports `handleIngest` from the same `_shared/collector-ingest-core.ts` the
+edge function uses, so the contract it enforces is the deployed one.
+
+```bash
+cd collector/server/local
+node server.ts --mint my-box     # prints the key once
+node server.ts                   # serves on 8787
+```
+
+Open <http://localhost:8787> for the environment list with derived health.
+Point an agent at it with `LIGHTOS_URL=http://localhost:8787`.
+
+| Route | What it does |
+|---|---|
+| `POST /functions/v1/collector-ingest` | The real endpoint, same path as production |
+| `GET /` | Environment list, health, last seen; refreshes every 10s |
+| `GET /api/environments` | The same as JSON |
+| `GET /api/measurements?environment=<id>` | Recent measurements |
+| `POST /api/environments` | Mint, `{"name":"..."}` |
+| `POST /api/environments/<id>/revoke` | Revoke |
+
+Measurements land in `collector.db` beside the server, which is gitignored.
+Delete it to start clean.
+
+What this is not: there is no auth, so every environment belongs to one
+stand-in user. It is for proving the wire contract and developing the agent,
+not for holding real data.
+
+### Running the agent where there is no /proc
+
+The agent reads `/proc`, so on Windows or macOS point it at a fixture tree
+instead, which is what its own tests use:
+
+```bash
+python lightcollect.py --print --root /path/to/fakeroot
+```
+
+`collector/lightcollect/tests/test_lightcollect.py` has `write_proc_root()`,
+which writes a usable tree. Readings then describe the fixture, not the
+machine, which is fine for checking delivery and wrong for anything else.
+
 ## Deploying
 
 ```bash

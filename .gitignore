@@ -10,3 +10,8 @@ __pycache__/
 # Never commit a collector key or an env file holding one
 *.env
 collector.env
+
+# Local collector server state
+collector/server/local/*.db
+collector/server/local/*.db-wal
+collector/server/local/*.db-shm
