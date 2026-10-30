@@ -1,18 +1,25 @@
 # Collector box: hardware spec and Ubuntu setup
 
 Target: a small always-on Linux machine that reads host metrics and pushes them
-outbound over HTTPS to the app. Outbound only — no inbound ports, no
-public IP, no port forwarding.
+outbound over HTTPS to LightOS. Outbound only: no inbound ports, no public IP,
+no port forwarding.
 
-> **Status:** all three pieces now exist. The agent is
-> `collector/lightcollect/`; the endpoint is the `collector-ingest` edge
-> function plus the `20261028000000_collector_ingest.sql` migration, both
-> under `collector/server/`; and keys are minted from **Infrastructure**
-> in the app's dashboard
-> (`/dashboard/infrastructure`). Nothing is deployed yet: push the migration
-> and `supabase functions deploy collector-ingest` first, or the page will have
-> no tables to read. If you would rather not run the app, the same key comes
-> out of `select * from collector_environment_create('collector-box');`.
+> **Status (2026-10-30):** the receiver is deployed and live at
+> `https://lightos.lightrailabs.ai/api/public/v1/infrastructure`, with its
+> tables in place. An unauthenticated POST returns `401`. A real measurement
+> from a Linux host was sent there with the maintained collector, stored, and
+> the key was then revoked and refused with `401`.
+>
+> The box agent is the **maintained collector** in
+> [`Lightiam/product-launch-hub` → `collector/`](https://github.com/Lightiam/product-launch-hub/tree/main/collector),
+> also downloadable as `https://lightos.lightrailabs.ai/downloads/lightos-collector.zip`.
+> `collector/server/` and `collector/lightcollect/` in this repository speak an
+> older, never-deployed contract (`/functions/v1/collector-ingest`). They are
+> kept only for local development on port 8787 and **will not deliver to the
+> live app**. Do not follow older instructions that mention
+> `<project-ref>.supabase.co` or `supabase functions deploy`.
+>
+> Not yet run by anyone: section 9 on a dedicated box, including the reboot.
 
 ## 1. Hardware
 
@@ -26,8 +33,9 @@ Minimum for a collector-only box:
 | Network | Any outbound path to 443 | Wired Ethernet |
 | GPU | None | None |
 
-The agent itself wants roughly 1 core and 256-512 MB. The rest is OS, journald,
-and an on-disk spool so measurements survive a network outage.
+The agent itself wants well under 1 core and 256 MB. The rest is OS and journald.
+If the network is down, a failed snapshot is not kept; the next poll sends a fresh
+measurement.
 
 Reasonable boxes:
 
@@ -102,135 +110,84 @@ costs it nothing.
 ## 5. Service account
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin lightos-collector
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lightos
 ```
+
+`lightos` is the account the shipped systemd unit runs as.
 
 For Slurm collection, use an account that can run `squeue`/`scontrol` instead,
 and skip the `--shell /usr/sbin/nologin` part.
 
 ## 6. Credentials
 
-Mint the key in the app first: **Dashboard → Infrastructure → New
-environment**. Name it after this box. The key is shown once, with the two
-lines below already filled in and a copy button, because only its SHA-256 is
-stored — lose it and you mint a new one rather than recovering it.
+Sign in at <https://lightos.lightrailabs.ai/infrastructure>. Enter an
+environment name (name it after this box), choose **Linux / CVM**, click
+**Add environment**, then **Create collector key**. The key starts with `lfc_`,
+is shown once, and only its SHA-256 is stored: lose it and you create a new one.
+It is not an `lfk_` trace key.
 
-The key is a secret. Put it in a root-owned file, never on the command line,
-where it would show up in `ps` output:
+Put it in a root-owned file, never on the command line, where it would show up
+in `ps` output:
 
 ```bash
-sudo install -d -m 0750 /etc/lightos
-sudo tee /etc/lightos/collector.env >/dev/null <<'ENV'
-LIGHTOS_URL=https://<project-ref>.supabase.co
+sudo tee /etc/lightos-collector.env >/dev/null <<'ENV'
+LIGHTOS_ORIGIN=https://lightos.lightrailabs.ai
+LIGHTOS_PLATFORM=linux
 LIGHTOS_COLLECTOR_KEY=lfc_replace_me
 ENV
-sudo chmod 0640 /etc/lightos/collector.env
-sudo chown root:lightos-collector /etc/lightos/collector.env
+sudo chmod 0600 /etc/lightos-collector.env
+sudo chown root:root /etc/lightos-collector.env
 ```
 
-`LIGHTOS_URL` is the Supabase project host, which is what the Infrastructure
-page copies for you — not the app's own domain.
+`LIGHTOS_ORIGIN` is the app's own address. The collector adds
+`/api/public/v1/infrastructure` itself.
 
 ## 7. Install the collector
 
-The agent is a single standard-library file, so there is nothing to build and no
-`pip install`. Ubuntu 24.04 already ships `python3`.
-
-Copy `collector/lightcollect/lightcollect.py` from this repo to the box, then:
-
 ```bash
-sudo install -m 0755 lightcollect.py /usr/local/bin/lightos-collector
-python3 --version      # 3.9 or newer
+sudo apt install -y python3-venv unzip
+cd /tmp
+curl -fsSLO https://lightos.lightrailabs.ai/downloads/lightos-collector.zip
+sudo unzip -o lightos-collector.zip -d /opt
+ls /opt/lightos-collector/lightos_collector.py
+sudo python3 -m venv /opt/lightos-collector/.venv
+sudo /opt/lightos-collector/.venv/bin/pip install -r /opt/lightos-collector/requirements.txt
 ```
 
-Prove it reads this host correctly before wiring up systemd — `--print`
-collects a measurement and prints it instead of sending it, so it needs no key
-and no network:
+One real send, which exits `0` on an accepted snapshot, `1` on a delivery
+failure and `2` on a rejected or revoked key:
 
 ```bash
-/usr/local/bin/lightos-collector --print
+sudo -u lightos env $(sudo cat /etc/lightos-collector.env | xargs) \
+  /opt/lightos-collector/.venv/bin/python /opt/lightos-collector/lightos_collector.py --once; echo "exit=$?"
 ```
 
-You should see real `memory`, `load`, `disk` and `network` figures for the box.
-`cpu.utilization` is measured over a one-second window here and reports `null`
-rather than a fabricated zero if the counters do not move.
-
-Then one real send, which exits non-zero if delivery failed:
-
-```bash
-sudo -u lightos-collector env $(sudo cat /etc/lightos/collector.env | xargs) \
-  /usr/local/bin/lightos-collector --once; echo "exit=$?"
-```
+Expect `Snapshot accepted: 1 entities, 0 collection errors`.
 
 ## 8. systemd unit
 
-Save as `/etc/systemd/system/lightos-collector.service`:
-
-```ini
-[Unit]
-Description=Host metrics collector
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=lightos-collector
-EnvironmentFile=/etc/lightos/collector.env
-ExecStart=/usr/local/bin/lightos-collector
-Restart=always
-RestartSec=10
-
-StateDirectory=lightos-collector
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-MemoryMax=256M
-CPUQuota=25%
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`ProtectSystem=strict` leaves `/proc` and `/sys` readable, so host metrics
-still work; `StateDirectory` gives the agent `/var/lib/lightos-collector` for
-its offline spool. Then:
-
 ```bash
+sudo cp /opt/lightos-collector/deploy/lightos-collector.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now lightos-collector
 systemctl status lightos-collector
 journalctl -u lightos-collector -f
 ```
 
-## 9. Verify
+The unit restarts on failure but not on exit `2`, so a revoked key stops the
+service instead of retrying forever.
 
-Reachability from the box, before blaming the agent:
+## 9. Verify (the test that has not been run on a dedicated box yet)
 
-```bash
-getent hosts <project-ref>.supabase.co
-curl -sS -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' \
-  https://<project-ref>.supabase.co/functions/v1/collector-ingest
-```
+1. Reachability: `curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X POST https://lightos.lightrailabs.ai/api/public/v1/infrastructure`
+   must print `HTTP 401`. A timeout or DNS failure is a network problem.
+2. Open <https://lightos.lightrailabs.ai/infrastructure>, select the
+   environment. **Last received** and the node's CPU, memory and disk must
+   update about every 60 seconds.
+3. `sudo reboot`. After it comes back, without logging in, the next
+   measurement must arrive within two minutes. This proves the unit starts on
+   its own.
+4. Revoke the key in Infrastructure. Within one interval the service logs
+   `Collector credential rejected` and stops (`systemctl status` shows exit 2).
 
-Any HTTP status back — `405` from the function itself, which only accepts POST,
-or a platform `401` — proves DNS, TLS and egress work. Only a timeout or a
-resolution failure is a real problem here. A `401` on an actual send means the
-key is wrong or revoked.
-
-Then open **Dashboard → Infrastructure**. The environment should turn *Live*
-within a minute or two, showing this box's hostname and a rising measurement
-count; **Metrics** opens the latest sample. *Stale* means it posted once and
-then stopped — three missed ticks. Reboot once to prove the unit comes back up
-on its own.
-
-If the app shows nothing, check whether the agent is spooling rather than
-sending — a non-empty spool means it is collecting fine and failing to deliver:
-
-```bash
-sudo wc -l /var/lib/lightos-collector/spool/measurements.jsonl
-journalctl -u lightos-collector | grep "delivery failed" | tail -5
-```
+Record the date and the hostname here when steps 1 to 4 pass.

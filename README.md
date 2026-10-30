@@ -1,48 +1,37 @@
 # OS_Run
 
-Working folder for the host-metrics collector: a small always-on Linux
-box that reads its own host state and pushes it outbound over HTTPS to the
-the app. No inbound ports, no public IP, no port forwarding.
+Working folder for the host-metrics collector box: a small always-on Linux
+machine that reads its own host state and pushes it outbound over HTTPS to
+LightOS at <https://lightos.lightrailabs.ai>. No inbound ports, no public IP, no
+port forwarding.
 
 ## What is here
 
 | Path | What it is |
 |---|---|
-| [`collector-box-runbook.md`](collector-box-runbook.md) | Hardware spec and the Ubuntu setup walkthrough for the collector box, end to end |
-| [`collector/`](collector/README.md) | The collector subsystem: agent, ingest endpoint, schema and UI |
-| `Olares/` | Submodule pointing at [beclab/Olares](https://github.com/beclab/Olares) at `3a1a0fb` |
-| `Olares-main/` | A snapshot of the same upstream tree, extracted from the repository zip |
+| [`collector-box-runbook.md`](collector-box-runbook.md) | Hardware spec and the Ubuntu setup for the box, end to end. Start here. |
+| [`collector/`](collector/README.md) | Local development only: a SQLite ingest server on port 8787, the `lightcollect` agent and UI experiments. |
 
-Olares was evaluated as a ready-made platform to run the collector on and then
-set aside: its documented floor is 4 CPU cores, 8 GB RAM and 150 GB of SSD
-(16 GB RAM on the Windows/WSL2 path, which its own docs mark as not for
-production), which is far more machine than a metrics collector needs. The two
-copies are kept here as the reference that conclusion was drawn from. They are
-upstream's code, not this project's.
+## What is deployed
 
-## The collector itself
+- **Receiver:** `https://lightos.lightrailabs.ai/api/public/v1/infrastructure`,
+  live, with its tables applied. Unauthenticated requests get `401`.
+- **Box agent:** the maintained collector in
+  [`Lightiam/product-launch-hub` → `collector/`](https://github.com/Lightiam/product-launch-hub/tree/main/collector),
+  also at `https://lightos.lightrailabs.ai/downloads/lightos-collector.zip`.
+- **Forwarding this repo's local server to the live app:** `collector/sender/`
+  in product-launch-hub.
 
-The runbook is the entry point and [`collector/`](collector/README.md) holds
-the code, all of it, so this repository is what you point at:
+`collector/server/` (the `collector-ingest` function and its migration) and
+`collector/lightcollect/` here use an older contract that was never deployed and
+will not deliver to the live app. Use them only against the local server.
 
-- **Agent** — `collector/lightcollect/`. One standard-library Python file:
-  reads `/proc`, batches measurements as newline-delimited JSON, spools to disk
-  when the network is down.
-- **Endpoint and schema** — `collector/server/`. Deploys to Supabase.
-- **UI** — `collector/app/`. Copied into the app's own tree, with the route,
-  sidebar entry and generated types supplied as a patch.
-
-Nothing here is deployed yet. `collector/README.md` has the two commands.
-
-Keys are `lfc_` strings minted in the app's Infrastructure page. Only their
+Keys are `lfc_` strings created in the app's Infrastructure page. Only their
 SHA-256 is stored, so a key is shown once and never recoverable.
 
-## Cloning
+## Olares
 
-`Olares/` is a submodule, so a plain clone leaves it empty:
-
-```bash
-git clone --recurse-submodules https://github.com/Lightiam/OS_Run.git
-```
-
-Or, in an existing clone, `git submodule update --init`.
+Olares was evaluated as a platform to run the collector on and set aside: its
+documented floor is 4 CPU cores, 8 GB RAM and 150 GB SSD, far more machine than
+a metrics collector needs. The upstream copies that were kept for reference have
+been removed; the source is at <https://github.com/beclab/Olares>.

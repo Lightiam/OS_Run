@@ -1,9 +1,0 @@
-{
-  "registry-mirrors": [
-    "https://mirrors.olares.cn"
-  ],
-
-  "features": {
-    "containerd-snapshotter": false
-  }
-}
